@@ -3,6 +3,7 @@
 data/*
 !data/sp500_membership.csv
 
+cache/
 options_archive/
 .ipynb_checkpoints/
 __pycache__/
