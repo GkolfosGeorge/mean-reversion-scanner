@@ -1,0 +1,10 @@
+# Ignore everything cached/downloaded inside data/, but keep the point-in-time
+# membership CSV — the repo needs it committed to run out-of-the-box.
+data/*
+!data/sp500_membership.csv
+
+options_archive/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.env
