@@ -1,0 +1,32 @@
+name: Daily Portfolio Tracker
+
+on:
+  # schedule:
+  #   - cron: '0 22 * * 1-5'   # ← uncomment once weights/methodology are finalized
+  workflow_dispatch:   # manual-only for now, while still tuning weights/signals
+
+permissions:
+  contents: write   # needed so the workflow can commit portfolio_history.csv back
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas yfinance   # lightweight, independent of requirements.txt —
+                                             # a break in the MR repo's heavier deps never blocks this
+
+      - run: python update_portfolio_tracker.py
+
+      - name: Commit updated history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add portfolio_history.csv
+          git diff --staged --quiet && echo "No changes to commit" || git commit -m "Daily portfolio update: $(date +%Y-%m-%d)"
+          git push
