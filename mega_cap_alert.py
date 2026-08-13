@@ -48,8 +48,8 @@ import scorer_mr
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit this to set your own alert threshold
 # ─────────────────────────────────────────────────────────────────────────────
-ALERT_SCORE_THRESHOLD = 6.0     # <-- SET YOUR OWN THRESHOLD HERE
-ALERT_CAP_TIERS       = [5]     # <-- SET YOUR OWN TIER(S) HERE, e.g. [4, 5] for
+ALERT_SCORE_THRESHOLD = 5.0     # <-- SET YOUR OWN THRESHOLD HERE
+ALERT_CAP_TIERS       = [4,5]     # <-- SET YOUR OWN TIER(S) HERE, e.g. [4, 5] for
                                  #     Mega-cap + Ultra Mega-cap together.
                                  #     See scorer_mr.CAP_TIERS / CAP_TIER_LABELS
                                  #     for what each number means.
