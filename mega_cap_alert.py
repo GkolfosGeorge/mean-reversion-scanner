@@ -150,7 +150,7 @@ def send_alert_email(scored: list[dict], now_str: str) -> None:
     msg["From"]    = gmail_user
     msg["To"]      = recipient
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465) as server:
         server.login(gmail_user, app_pw)
         server.send_message(msg)
 
