@@ -18,11 +18,16 @@ Architecture:
 
 Usage:
     from scorer_mr import compute_scores, print_mr_report, to_dataframe
+    from sector_lookup import get_sectors_and_caps
+
+    sectors, market_caps = get_sectors_and_caps(tickers)
 
     scored = compute_scores(
         data        = data,           # OHLCV MultiIndex DataFrame
         sectors     = sectors,        # dict {ticker: sector} from sector_lookup.py
         options_df  = scanner.to_dataframe(),  # optional — from OptionsScanner
+        market_caps = market_caps,    # dict {ticker: market_cap} — optional
+        cap_tier    = 5,               # optional — 1=Small...5=Ultra Mega-cap (see CAP_TIERS)
         top_n       = 20,
     )
     print_mr_report(scored)
@@ -100,6 +105,36 @@ PCR_MIN_TOTAL_VOLUME = 500   # minimum total options volume
 TOP_N          = 20
 MAX_PER_SECTOR = 4
 MIN_SCORE      = 4.0         # below this, excluded
+
+# ── Market Cap Tiers ──────────────────────────────────────────────────────────
+# Configurable from the CONFIG cell. Bounds in USD. Calibrated to the S&P 500's
+# own cap range (~$5-10B smallest to ~$3-4T largest), NOT the general US market
+# (where "small cap" means something entirely different).
+# Freely adjust in the notebook — these are just sensible defaults.
+CAP_TIERS = {
+    1: (0,                15_000_000_000),   # Small-cap   (relative to S&P500)
+    2: (15_000_000_000,   50_000_000_000),   # Mid-cap
+    3: (50_000_000_000,  150_000_000_000),   # Large-cap
+    4: (150_000_000_000, 500_000_000_000),   # Mega-cap
+    5: (500_000_000_000, float("inf")),      # Ultra Mega-cap (AAPL, MSFT, NVDA...)
+}
+CAP_TIER_LABELS = {
+    1: "Small-cap",
+    2: "Mid-cap",
+    3: "Large-cap",
+    4: "Mega-cap",
+    5: "Ultra Mega-cap",
+}
+
+
+def _cap_tier_label(market_cap: Optional[float], cap_tiers: dict) -> str:
+    """Returns the tier label for a given market cap, or 'Unknown' if missing."""
+    if market_cap is None or pd.isna(market_cap):
+        return "Unknown"
+    for tier_num, (lo, hi) in cap_tiers.items():
+        if lo <= market_cap < hi:
+            return CAP_TIER_LABELS.get(tier_num, f"Tier {tier_num}")
+    return "Unknown"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,6 +403,9 @@ def compute_scores(
     data:           pd.DataFrame,
     sectors:        Optional[dict] = None,
     options_df:     Optional[pd.DataFrame] = None,
+    market_caps:    Optional[dict] = None,   # {ticker: market_cap in USD} — from sector_lookup.get_market_caps()
+    cap_tier:       Optional[int]  = None,   # 1-5 — if given, hard filter: only tickers in this tier pass
+    cap_tiers:      Optional[dict] = None,   # override the CAP_TIERS module default
     top_n:          int   = TOP_N,
     max_per_sector: int   = MAX_PER_SECTOR,
     min_score:      float = MIN_SCORE,
@@ -403,6 +441,13 @@ def compute_scores(
         sectors:        dict {ticker: sector} (from sector_lookup.py) — optional,
                          used ONLY for portfolio diversification
         options_df:     DataFrame from OptionsScanner.to_dataframe() — optional
+        market_caps:    dict {ticker: market_cap} (from sector_lookup.get_market_caps())
+                         — optional. Without it, cap_tier filter is ignored.
+        cap_tier:       1-5 — if given, HARD FILTER: only tickers in the matching
+                         market cap tier pass (see CAP_TIERS). Tickers with
+                         unknown market cap are excluded when the filter is active.
+        cap_tiers:      dict {tier_num: (lo, hi)} — override the module-level
+                         CAP_TIERS from the CONFIG cell.
         top_n:          number of final results
         max_per_sector: diversification limit
         min_score:      minimum composite score
@@ -437,6 +482,8 @@ def compute_scores(
     _williams_period  = williams_period  if williams_period  is not None else WILLIAMS_PERIOD
     _rsi_max          = rsi_max          if rsi_max          is not None else RSI_MAX
     _min_avg_volume   = min_avg_volume   if min_avg_volume   is not None else MIN_AVG_VOLUME
+    _cap_tiers        = cap_tiers        if cap_tiers        is not None else CAP_TIERS
+    _market_caps      = market_caps or {}
 
     # No-PCR weights — proportional redistribution of PCR weight
     _total_no_pcr = _w_rsi + _w_bb + _w_mr + _w_stochrsi + _w_williams
@@ -471,7 +518,7 @@ def compute_scores(
     tickers = data.columns.get_level_values(0).unique().tolist()
 
     results     = []
-    filtered_out = {"no_data": 0, "volume": 0, "rsi": 0, "earnings": 0, "low_score": 0}
+    filtered_out = {"no_data": 0, "volume": 0, "market_cap": 0, "rsi": 0, "earnings": 0, "low_score": 0}
 
     for ticker in tickers:
 
@@ -500,6 +547,17 @@ def compute_scores(
         if pd.isna(avg_vol) or avg_vol < _min_avg_volume:
             filtered_out["volume"] += 1
             continue
+
+        # ── Hard filter: Market Cap Tier ────────────────────────────────────────
+        ticker_mcap = _market_caps.get(ticker)
+        if cap_tier is not None:
+            if ticker_mcap is None or pd.isna(ticker_mcap):
+                filtered_out["market_cap"] += 1
+                continue
+            lo, hi = _cap_tiers.get(cap_tier, (0, float("inf")))
+            if not (lo <= ticker_mcap < hi):
+                filtered_out["market_cap"] += 1
+                continue
 
         # ── Indicators ────────────────────────────────────────────────────────
         rsi_series              = _rsi(close, _rsi_period)
@@ -630,6 +688,8 @@ def compute_scores(
             "composite_score": composite,
             "setup":           setup,
             "sector":          _sectors.get(ticker, "Unknown"),
+            "market_cap":      ticker_mcap,
+            "cap_tier_label":  _cap_tier_label(ticker_mcap, _cap_tiers),
             "price":           round(price, 2),
             "atr":             round(atr_val, 2),
             # Scores breakdown
@@ -688,6 +748,9 @@ def compute_scores(
     print(f"  {'─'*35}")
     print(f"  No data          : {filtered_out['no_data']:>4}")
     print(f"  Volume < 500k    : {filtered_out['volume']:>4}")
+    if cap_tier is not None:
+        tier_label = CAP_TIER_LABELS.get(cap_tier, f"Tier {cap_tier}")
+        print(f"  Cap tier != {cap_tier} ({tier_label}): {filtered_out['market_cap']:>4}")
     print(f"  RSI > {_rsi_max:.0f}         : {filtered_out['rsi']:>4}")
     if check_earnings:
         print(f"  Near earnings    : {filtered_out['earnings']:>4}")
@@ -711,6 +774,8 @@ def to_dataframe(scored: list[dict]) -> pd.DataFrame:
             "Rank":        s["rank"],
             "Ticker":      s["ticker"],
             "Sector":      s["sector"],
+            "Cap":         s["cap_tier_label"],
+            "MarketCap($B)": round(s["market_cap"] / 1e9, 1) if s.get("market_cap") else None,
             "Score":       s["composite_score"],
             "Setup":       s["setup"],
             # Core signals
@@ -765,10 +830,14 @@ def print_mr_report(scored: list[dict]) -> None:
         # ATR regime emoji
         regime_str = s.get("atr_pct_label", "")
 
+        mcap_str = (
+            f"${s['market_cap']/1e9:,.0f}B ({s['cap_tier_label']})"
+            if s.get("market_cap") else "Cap: N/A"
+        )
         print(
             f"#{s['rank']:<3} {s['ticker']:<6} "
             f"Score: {s['composite_score']:.1f}  "
-            f"{s['setup']}  {regime_str}"
+            f"{s['setup']}  {regime_str}  {mcap_str}"
         )
         # Line 1: core signals
         print(
