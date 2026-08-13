@@ -18,10 +18,16 @@ Edit ALERT_SCORE_THRESHOLD and ALERT_CAP_TIERS below to set your own bar.
 ALERT_CAP_TIERS is a list — e.g. [5] for Ultra Mega-cap only, or [4, 5] for
 Mega-cap + Ultra Mega-cap together.
 
+Uses Yahoo SMTP (smtp.mail.yahoo.com). The env var names below still say
+"GMAIL_*" for historical reasons — they hold Yahoo credentials now, the
+names just weren't renamed to avoid touching the GitHub Secrets / workflow
+config. Functionally it's Yahoo, not Gmail.
+
 ── SECRETS (set as GitHub repo secrets, read via env vars) ──────────────────
-  GMAIL_USER          - sender Gmail address
-  GMAIL_APP_PASSWORD  - Gmail App Password (NOT your regular password —
-                         generate one at https://myaccount.google.com/apppasswords)
+  GMAIL_USER          - sender Yahoo address (despite the name)
+  GMAIL_APP_PASSWORD  - Yahoo App Password (NOT your regular password —
+                         generate one from Yahoo Account Security ->
+                         "Generate app password")
   ALERT_RECIPIENT     - where to send the alert (can be the same as GMAIL_USER)
 
 Usage:
@@ -121,18 +127,44 @@ def main():
     send_alert_email(scored, now_str)
 
 
+def _fmt(val, fmt: str, default: str = "N/A") -> str:
+    """Safely formats a value that might be None (e.g. missing indicator)."""
+    if val is None:
+        return default
+    return format(val, fmt)
+
+
 def send_alert_email(scored: list[dict], now_str: str) -> None:
     lines = [f"Mega-Cap Mean-Reversion Alert — {now_str}", ""]
 
     for s in scored:
+        pcr_str = f"PCR={s['pcr_volume']:.1f}({s['s_pcr']:.0f})" if s.get("has_pcr") else "PCR=N/A"
+
         lines.append(
             f"{s['ticker']}  Score: {s['composite_score']:.1f}  {s['setup']}  "
             f"${s['market_cap']/1e9:,.0f}B ({s['cap_tier_label']})  [{s['sector']}]"
         )
+        # Line 2: raw indicator values, with their sub-scores in parentheses —
+        # same format as print_mr_report() in the notebook.
         lines.append(
-            f"  Price: ${s['price']}   RSI: {s['rsi']:.0f}   "
+            f"  RSI={s['rsi']:.0f}({s['s_rsi']:.0f})   "
+            f"BB%={_fmt(s['pct_b'], '.2f')}({s['s_bb']:.0f})   "
+            f"Z={_fmt(s['z_score'], '+.2f')}({s['s_mr']:.0f})   "
+            f"{pcr_str}"
+        )
+        lines.append(
+            f"  StochRSI_K={s['stoch_k']:.2f}({s['s_stochrsi']:.0f})   "
+            f"Williams%R={s['williams_r']:.0f}({s['s_williams']:.0f})   "
+            f"ATR_Pct={s['atr_percentile']:.0f}% {s['atr_pct_label']}   "
+            f"VolRatio={s['vol_ratio']:.1f}x"
+        )
+        # Line 4: price / trade levels
+        rr_str = f"{s['rr_ratio']:.1f}x" if s.get("rr_ratio") else "N/A"
+        lines.append(
+            f"  Price: ${s['price']}   ATR: ${s['atr']}   "
             f"Entry: ${s['entry_low']}-${s['entry_high']}   "
-            f"Stop: ${s['stop_loss']}   T2: ${s['target_2']}   R/R: {s['rr_ratio']}x"
+            f"Stop: ${s['stop_loss']}   T2: ${s['target_2']}   R/R: {rr_str}   "
+            f"AvgVol: {s['avg_volume_m']}M"
         )
         lines.append("")
 
@@ -150,7 +182,7 @@ def send_alert_email(scored: list[dict], now_str: str) -> None:
     msg["From"]    = gmail_user
     msg["To"]      = recipient
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465) as server:
         server.login(gmail_user, app_pw)
         server.send_message(msg)
 
