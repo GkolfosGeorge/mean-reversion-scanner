@@ -14,9 +14,12 @@ Sends ONE email per run with two sections:
 
   2. WATCHLIST — a fixed list of tickers you name yourself (WATCHLIST,
      can be anything yfinance recognizes — not limited to the S&P 500).
-     These are ALWAYS included in the email, regardless of score. Good for
-     names you want to track manually even when they're not "opportunities"
-     (e.g. BABA, NBIS).
+     These are ALWAYS included in the email, regardless of score, RSI, or
+     volume — every hard filter is disabled for this section on purpose.
+     Good for names you want to track daily no matter what (e.g. BABA,
+     NBIS), not just when they happen to look like a technical opportunity.
+     The only thing that can still exclude a ticker here is a genuine data
+     problem (ticker not found, or not enough trading history yet).
 
 The email is sent whenever there's anything to report — which, since the
 watchlist is unconditional, is effectively every run (unless WATCHLIST is
@@ -55,8 +58,8 @@ import scorer_mr
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit this
 # ─────────────────────────────────────────────────────────────────────────────
-ALERT_SCORE_THRESHOLD = 6.5     # <-- mega-cap section: minimum score to include
-ALERT_CAP_TIERS       = [4,5]     # <-- mega-cap section: e.g. [4, 5] for Mega + Ultra Mega
+ALERT_SCORE_THRESHOLD = 6.0     # <-- mega-cap section: minimum score to include
+ALERT_CAP_TIERS       = [5]     # <-- mega-cap section: e.g. [4, 5] for Mega + Ultra Mega
                                  #     See scorer_mr.CAP_TIERS / CAP_TIER_LABELS.
 WATCHLIST              = ["BABA", "V","UNH","GOOG","AMZN","NFLX","EBAY","AVGO","VT","COPX","IEMG"]   # <-- always-shown tickers, any yfinance symbol
 UNIVERSE               = "sp500"
@@ -123,10 +126,35 @@ def get_mega_cap_alerts() -> list[dict]:
     return scored
 
 
-def get_watchlist_scores() -> tuple[list[dict], list[str]]:
-    """Section 2: fixed tickers, always returned regardless of score.
-    Returns (scored, missing) — missing = tickers that failed hard filters
-    or had no data, so the email can be honest about what it couldn't report."""
+def _diagnose_exclusion(ticker: str, data) -> str:
+    """
+    With RSI/volume hard filters disabled for the watchlist (see
+    get_watchlist_scores), the only way a ticker can still be missing is a
+    genuine data problem: not found, or not enough history to compute
+    anything (~63 trading days minimum — this floor can't be bypassed,
+    without it the indicators would just be NaN).
+    """
+    try:
+        df = data[ticker].dropna(subset=["Close"])
+    except (KeyError, TypeError):
+        return "no data (yfinance couldn't find this ticker)"
+
+    min_needed = max(scorer_mr.BB_PERIOD, scorer_mr.MR_PERIOD // 4, scorer_mr.RSI_PERIOD) + 5
+    if len(df) < min_needed:
+        return f"insufficient history ({len(df)} days, need {min_needed}+)"
+
+    price = df["Close"].iloc[-1]
+    if price <= 0 or pd.isna(price):
+        return "invalid price data"
+
+    return "unknown (check manually — unexpected)"
+
+
+def get_watchlist_scores() -> tuple[list[dict], list[tuple[str, str]]]:
+    """Section 2: fixed tickers, ALWAYS returned regardless of score, RSI,
+    or volume — the only thing that can still exclude a ticker here is a
+    genuine data problem (see _diagnose_exclusion). Unlike the mega-cap
+    section, this one bypasses every hard filter on purpose."""
     if not WATCHLIST:
         return [], []
 
@@ -138,7 +166,7 @@ def get_watchlist_scores() -> tuple[list[dict], list[str]]:
     )
     if data is None or data.empty:
         print("   [Watchlist] ⚠️ Data download failed — skipping this section.")
-        return [], WATCHLIST
+        return [], [(t, "data download failed") for t in WATCHLIST]
 
     scored = scorer_mr.compute_scores(
         data           = data,
@@ -146,13 +174,15 @@ def get_watchlist_scores() -> tuple[list[dict], list[str]]:
         market_caps    = market_caps,
         top_n          = len(WATCHLIST),
         max_per_sector = len(WATCHLIST),
-        min_score      = -999,   # show every ticker, regardless of score
+        min_score      = -999,        # show every ticker, regardless of score
+        rsi_max        = 999,         # disable RSI hard filter — show even overbought names
+        min_avg_volume = 0,           # disable volume hard filter
         verbose        = False,
     )
     scored_tickers = {s["ticker"] for s in scored}
-    missing = [t for t in WATCHLIST if t not in scored_tickers]
+    missing = [(t, _diagnose_exclusion(t, data)) for t in WATCHLIST if t not in scored_tickers]
     print(f"   [Watchlist] {len(scored)}/{len(WATCHLIST)} tickers scored"
-          + (f" — missing: {', '.join(missing)}" if missing else ""))
+          + (f" — missing: {', '.join(f'{t} ({r})' for t, r in missing)}" if missing else ""))
     return scored, missing
 
 
@@ -197,7 +227,7 @@ def _format_ticker_block(s: dict) -> list[str]:
 def send_email(
     mega_scored:        list[dict],
     watchlist_scored:   list[dict],
-    watchlist_missing:  list[str],
+    watchlist_missing:  list[tuple[str, str]],
     now_str:            str,
 ) -> None:
     lines = [f"Daily Alert — {now_str}", ""]
@@ -219,7 +249,9 @@ def send_email(
         for s in sorted(watchlist_scored, key=lambda x: -x["composite_score"]):
             lines.extend(_format_ticker_block(s))
         if watchlist_missing:
-            lines.append(f"Not scored (hard filter or insufficient data): {', '.join(watchlist_missing)}")
+            lines.append("Not scored (reason shown per ticker):")
+            for ticker, reason in watchlist_missing:
+                lines.append(f"  {ticker}: {reason}")
             lines.append("")
 
     lines.append("─" * 50)
