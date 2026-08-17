@@ -58,8 +58,8 @@ import scorer_mr
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit this
 # ─────────────────────────────────────────────────────────────────────────────
-ALERT_SCORE_THRESHOLD = 6.0     # <-- mega-cap section: minimum score to include
-ALERT_CAP_TIERS       = [5]     # <-- mega-cap section: e.g. [4, 5] for Mega + Ultra Mega
+ALERT_SCORE_THRESHOLD = 6.5     # <-- mega-cap section: minimum score to include
+ALERT_CAP_TIERS       = [4,5]     # <-- mega-cap section: e.g. [4, 5] for Mega + Ultra Mega
                                  #     See scorer_mr.CAP_TIERS / CAP_TIER_LABELS.
 WATCHLIST              = ["BABA", "V","UNH","GOOG","AMZN","NFLX","EBAY","AVGO","VT","COPX","IEMG"]   # <-- always-shown tickers, any yfinance symbol
 UNIVERSE               = "sp500"
@@ -202,12 +202,16 @@ def main():
 
 def _format_ticker_block(s: dict) -> list[str]:
     """Formats one ticker's full indicator breakdown — shared by both sections."""
-    pcr_str = f"PCR={s['pcr_volume']:.1f}({s['s_pcr']:.0f})" if s.get("has_pcr") else "PCR=N/A"
-    rr_str  = f"{s['rr_ratio']:.1f}x" if s.get("rr_ratio") else "N/A"
+    pcr_str  = f"PCR={s['pcr_volume']:.1f}({s['s_pcr']:.0f})" if s.get("has_pcr") else "PCR=N/A"
+    rr_str   = f"{s['rr_ratio']:.1f}x" if s.get("rr_ratio") else "N/A"
+    # ETFs have no marketCap in yfinance (they use totalAssets instead) —
+    # market_cap comes back None for them, so this must be handled safely
+    # or the whole email crashes the moment an ETF makes it into either section.
+    mcap_str = f"${s['market_cap']/1e9:,.0f}B" if s.get("market_cap") else "Cap: N/A"
 
     return [
         f"{s['ticker']}  Score: {s['composite_score']:.1f}  {s['setup']}  "
-        f"${s['market_cap']/1e9:,.0f}B ({s['cap_tier_label']})  [{s['sector']}]",
+        f"{mcap_str} ({s['cap_tier_label']})  [{s['sector']}]",
         f"  RSI={s['rsi']:.0f}({s['s_rsi']:.0f})   "
         f"BB%={_fmt(s['pct_b'], '.2f')}({s['s_bb']:.0f})   "
         f"Z={_fmt(s['z_score'], '+.2f')}({s['s_mr']:.0f})   "
