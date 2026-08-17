@@ -1,22 +1,29 @@
 # mega_cap_alert.py
 """
-Automated Mega-Cap Mean-Reversion Alert
+Automated Mega-Cap Alert + Watchlist Digest (single email)
 ─────────────────────────────────────────────────────────────────────────────
 Standalone script — does NOT go through the notebook. Designed to run on a
 GitHub Actions schedule (2x/day: market open + market close).
 
-Scans ONLY the market-cap tier(s) you configure below (ALERT_CAP_TIERS — see
-scorer_mr.CAP_TIERS), using the exact same compute_scores() logic as the
-manual weekly notebook scan. If any ticker scores >= ALERT_SCORE_THRESHOLD,
-sends an email alert via Gmail SMTP.
+Sends ONE email per run with two sections:
 
-Only downloads OHLCV for the filtered subset, not the full S&P 500 — keeps
-the Actions run fast and light regardless of which tier(s) you pick.
+  1. MEGA-CAP ALERTS — scans the market-cap tier(s) you configure
+     (ALERT_CAP_TIERS, see scorer_mr.CAP_TIERS) and includes a ticker ONLY
+     if its score >= ALERT_SCORE_THRESHOLD. Same compute_scores() logic as
+     the manual weekly notebook scan.
+
+  2. WATCHLIST — a fixed list of tickers you name yourself (WATCHLIST,
+     can be anything yfinance recognizes — not limited to the S&P 500).
+     These are ALWAYS included in the email, regardless of score. Good for
+     names you want to track manually even when they're not "opportunities"
+     (e.g. BABA, NBIS).
+
+The email is sent whenever there's anything to report — which, since the
+watchlist is unconditional, is effectively every run (unless WATCHLIST is
+empty AND no mega-cap ticker qualifies).
 
 ── CONFIG ─────────────────────────────────────────────────────────────────
-Edit ALERT_SCORE_THRESHOLD and ALERT_CAP_TIERS below to set your own bar.
-ALERT_CAP_TIERS is a list — e.g. [5] for Ultra Mega-cap only, or [4, 5] for
-Mega-cap + Ultra Mega-cap together.
+Edit ALERT_SCORE_THRESHOLD, ALERT_CAP_TIERS, and WATCHLIST below.
 
 Uses Yahoo SMTP (smtp.mail.yahoo.com). The env var names below still say
 "GMAIL_*" for historical reasons — they hold Yahoo credentials now, the
@@ -46,13 +53,12 @@ from data_engine import download_sp500_data
 import scorer_mr
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG — edit this to set your own alert threshold
+# CONFIG — edit this
 # ─────────────────────────────────────────────────────────────────────────────
-ALERT_SCORE_THRESHOLD = 5.0     # <-- SET YOUR OWN THRESHOLD HERE
-ALERT_CAP_TIERS       = [4,5]     # <-- SET YOUR OWN TIER(S) HERE, e.g. [4, 5] for
-                                 #     Mega-cap + Ultra Mega-cap together.
-                                 #     See scorer_mr.CAP_TIERS / CAP_TIER_LABELS
-                                 #     for what each number means.
+ALERT_SCORE_THRESHOLD = 6.5     # <-- mega-cap section: minimum score to include
+ALERT_CAP_TIERS       = [4,5]     # <-- mega-cap section: e.g. [4, 5] for Mega + Ultra Mega
+                                 #     See scorer_mr.CAP_TIERS / CAP_TIER_LABELS.
+WATCHLIST              = ["BABA", "V","UNH","GOOG","AMZN","NFLX","EBAY","AVGO","VT","COPX","IEMG"]   # <-- always-shown tickers, any yfinance symbol
 UNIVERSE               = "sp500"
 DATA_FOLDER            = "data"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,34 +73,30 @@ def _in_target_tiers(market_cap: float, tiers: list[int]) -> bool:
     return False
 
 
-def main():
-    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-    tier_labels = ", ".join(
-        f"{t} ({scorer_mr.CAP_TIER_LABELS.get(t, '?')})" for t in ALERT_CAP_TIERS
-    )
-    print(f"🔍 Mega-cap alert check — {now_str}")
-    print(f"   Threshold: score >= {ALERT_SCORE_THRESHOLD}, tiers: {tier_labels}")
+def _fmt(val, fmt: str, default: str = "N/A") -> str:
+    """Safely formats a value that might be None (e.g. missing indicator,
+    or not enough history yet for a newly-listed ticker)."""
+    if val is None:
+        return default
+    return format(val, fmt)
 
-    # ── 1. Get full universe + market caps (cached ~3 days, cheap) ────────────
+
+def get_mega_cap_alerts() -> list[dict]:
+    """Section 1: tier-filtered, threshold-gated. Returns [] if nothing qualifies."""
     all_tickers = get_tickers(UNIVERSE)
     sectors, market_caps = get_sectors_and_caps(
         all_tickers, folder_path=DATA_FOLDER, universe_name=UNIVERSE,
     )
 
-    # ── 2. Filter down to the target tier(s) BEFORE downloading OHLCV ────────
-    # This is the key efficiency trick — we only ever download price history
-    # for the tickers in the requested tier(s), not the full 500.
     mega_tickers = [
         t for t in all_tickers
         if market_caps.get(t) is not None and _in_target_tiers(market_caps[t], ALERT_CAP_TIERS)
     ]
-    print(f"   {len(mega_tickers)} tickers match the selected tier(s)")
+    print(f"   [Mega-cap] {len(mega_tickers)} tickers match tiers {ALERT_CAP_TIERS}")
 
     if not mega_tickers:
-        print("   No tickers found in these tiers — nothing to scan.")
-        return
+        return []
 
-    # ── 3. Download OHLCV for the filtered subset only ─────────────────────────
     universe_tag = "_".join(str(t) for t in sorted(ALERT_CAP_TIERS))
     data = download_sp500_data(
         mega_tickers,
@@ -102,71 +104,123 @@ def main():
         universe_name=f"{UNIVERSE}_tiers{universe_tag}",
     )
     if data is None or data.empty:
-        print("   ⚠️ Data download failed — aborting.")
-        sys.exit(1)
+        print("   [Mega-cap] ⚠️ Data download failed — skipping this section.")
+        return []
 
-    # ── 4. Score — same logic as the manual weekly scan ───────────────────────
-    # NOTE: no cap_tier= passed here — the ticker list is ALREADY filtered to
-    # the requested tier(s) above, since compute_scores() only supports one
-    # tier at a time. Passing the pre-filtered `data` is enough.
+    # NOTE: no cap_tier= passed to compute_scores() — the ticker list is
+    # ALREADY filtered to the requested tier(s) above, since compute_scores()
+    # only supports one tier at a time. Passing the pre-filtered `data` is enough.
     scored = scorer_mr.compute_scores(
         data           = data,
         sectors        = sectors,
         market_caps    = market_caps,
-        top_n          = len(mega_tickers),   # don't truncate — we want all qualifiers
-        max_per_sector = len(mega_tickers),   # no diversification cap for alerts
+        top_n          = len(mega_tickers),
+        max_per_sector = len(mega_tickers),
         min_score      = ALERT_SCORE_THRESHOLD,
         verbose        = False,
     )
+    print(f"   [Mega-cap] {len(scored)} ticker(s) scored >= {ALERT_SCORE_THRESHOLD}")
+    return scored
 
-    if not scored:
-        print(f"   Nothing scored >= {ALERT_SCORE_THRESHOLD} today. No alert sent.")
+
+def get_watchlist_scores() -> tuple[list[dict], list[str]]:
+    """Section 2: fixed tickers, always returned regardless of score.
+    Returns (scored, missing) — missing = tickers that failed hard filters
+    or had no data, so the email can be honest about what it couldn't report."""
+    if not WATCHLIST:
+        return [], []
+
+    sectors, market_caps = get_sectors_and_caps(
+        WATCHLIST, folder_path=DATA_FOLDER, universe_name="custom_watchlist",
+    )
+    data = download_sp500_data(
+        WATCHLIST, folder_path=DATA_FOLDER, universe_name="custom_watchlist",
+    )
+    if data is None or data.empty:
+        print("   [Watchlist] ⚠️ Data download failed — skipping this section.")
+        return [], WATCHLIST
+
+    scored = scorer_mr.compute_scores(
+        data           = data,
+        sectors        = sectors,
+        market_caps    = market_caps,
+        top_n          = len(WATCHLIST),
+        max_per_sector = len(WATCHLIST),
+        min_score      = -999,   # show every ticker, regardless of score
+        verbose        = False,
+    )
+    scored_tickers = {s["ticker"] for s in scored}
+    missing = [t for t in WATCHLIST if t not in scored_tickers]
+    print(f"   [Watchlist] {len(scored)}/{len(WATCHLIST)} tickers scored"
+          + (f" — missing: {', '.join(missing)}" if missing else ""))
+    return scored, missing
+
+
+def main():
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    print(f"🔍 Alert check — {now_str}")
+
+    mega_scored = get_mega_cap_alerts()
+    watchlist_scored, watchlist_missing = get_watchlist_scores()
+
+    if not mega_scored and not watchlist_scored:
+        print("   Nothing to report — no email sent.")
         return
 
-    print(f"   🚨 {len(scored)} mega-cap opportunity(ies) found — sending alert.")
-    send_alert_email(scored, now_str)
+    send_email(mega_scored, watchlist_scored, watchlist_missing, now_str)
 
 
-def _fmt(val, fmt: str, default: str = "N/A") -> str:
-    """Safely formats a value that might be None (e.g. missing indicator)."""
-    if val is None:
-        return default
-    return format(val, fmt)
+def _format_ticker_block(s: dict) -> list[str]:
+    """Formats one ticker's full indicator breakdown — shared by both sections."""
+    pcr_str = f"PCR={s['pcr_volume']:.1f}({s['s_pcr']:.0f})" if s.get("has_pcr") else "PCR=N/A"
+    rr_str  = f"{s['rr_ratio']:.1f}x" if s.get("rr_ratio") else "N/A"
+
+    return [
+        f"{s['ticker']}  Score: {s['composite_score']:.1f}  {s['setup']}  "
+        f"${s['market_cap']/1e9:,.0f}B ({s['cap_tier_label']})  [{s['sector']}]",
+        f"  RSI={s['rsi']:.0f}({s['s_rsi']:.0f})   "
+        f"BB%={_fmt(s['pct_b'], '.2f')}({s['s_bb']:.0f})   "
+        f"Z={_fmt(s['z_score'], '+.2f')}({s['s_mr']:.0f})   "
+        f"{pcr_str}",
+        f"  StochRSI_K={s['stoch_k']:.2f}({s['s_stochrsi']:.0f})   "
+        f"Williams%R={s['williams_r']:.0f}({s['s_williams']:.0f})   "
+        f"ATR_Pct={s['atr_percentile']:.0f}% {s['atr_pct_label']}   "
+        f"VolRatio={s['vol_ratio']:.1f}x",
+        f"  Price: ${s['price']}   ATR: ${s['atr']}   "
+        f"Entry: ${s['entry_low']}-${s['entry_high']}   "
+        f"Stop: ${s['stop_loss']}   T2: ${s['target_2']}   R/R: {rr_str}   "
+        f"AvgVol: {s['avg_volume_m']}M",
+        "",
+    ]
 
 
-def send_alert_email(scored: list[dict], now_str: str) -> None:
-    lines = [f"Mega-Cap Mean-Reversion Alert — {now_str}", ""]
+def send_email(
+    mega_scored:        list[dict],
+    watchlist_scored:   list[dict],
+    watchlist_missing:  list[str],
+    now_str:            str,
+) -> None:
+    lines = [f"Daily Alert — {now_str}", ""]
 
-    for s in scored:
-        pcr_str = f"PCR={s['pcr_volume']:.1f}({s['s_pcr']:.0f})" if s.get("has_pcr") else "PCR=N/A"
-
-        lines.append(
-            f"{s['ticker']}  Score: {s['composite_score']:.1f}  {s['setup']}  "
-            f"${s['market_cap']/1e9:,.0f}B ({s['cap_tier_label']})  [{s['sector']}]"
-        )
-        # Line 2: raw indicator values, with their sub-scores in parentheses —
-        # same format as print_mr_report() in the notebook.
-        lines.append(
-            f"  RSI={s['rsi']:.0f}({s['s_rsi']:.0f})   "
-            f"BB%={_fmt(s['pct_b'], '.2f')}({s['s_bb']:.0f})   "
-            f"Z={_fmt(s['z_score'], '+.2f')}({s['s_mr']:.0f})   "
-            f"{pcr_str}"
-        )
-        lines.append(
-            f"  StochRSI_K={s['stoch_k']:.2f}({s['s_stochrsi']:.0f})   "
-            f"Williams%R={s['williams_r']:.0f}({s['s_williams']:.0f})   "
-            f"ATR_Pct={s['atr_percentile']:.0f}% {s['atr_pct_label']}   "
-            f"VolRatio={s['vol_ratio']:.1f}x"
-        )
-        # Line 4: price / trade levels
-        rr_str = f"{s['rr_ratio']:.1f}x" if s.get("rr_ratio") else "N/A"
-        lines.append(
-            f"  Price: ${s['price']}   ATR: ${s['atr']}   "
-            f"Entry: ${s['entry_low']}-${s['entry_high']}   "
-            f"Stop: ${s['stop_loss']}   T2: ${s['target_2']}   R/R: {rr_str}   "
-            f"AvgVol: {s['avg_volume_m']}M"
-        )
+    lines.append("═" * 50)
+    lines.append(f"MEGA-CAP ALERTS (score >= {ALERT_SCORE_THRESHOLD}, tiers {ALERT_CAP_TIERS})")
+    lines.append("═" * 50)
+    if mega_scored:
+        for s in mega_scored:
+            lines.extend(_format_ticker_block(s))
+    else:
+        lines.append("No qualifying mega-cap opportunities today.")
         lines.append("")
+
+    if WATCHLIST:
+        lines.append("═" * 50)
+        lines.append("WATCHLIST (always shown, regardless of score)")
+        lines.append("═" * 50)
+        for s in sorted(watchlist_scored, key=lambda x: -x["composite_score"]):
+            lines.extend(_format_ticker_block(s))
+        if watchlist_missing:
+            lines.append(f"Not scored (hard filter or insufficient data): {', '.join(watchlist_missing)}")
+            lines.append("")
 
     lines.append("─" * 50)
     lines.append("Generated automatically by mega_cap_alert.py")
@@ -177,8 +231,15 @@ def send_alert_email(scored: list[dict], now_str: str) -> None:
     app_pw      = os.environ["GMAIL_APP_PASSWORD"]
     recipient   = os.environ.get("ALERT_RECIPIENT", gmail_user)
 
+    subject_bits = []
+    if mega_scored:
+        subject_bits.append(f"{len(mega_scored)} mega-cap")
+    if WATCHLIST:
+        subject_bits.append(f"{len(watchlist_scored)} watchlist")
+    subject = "📊 Daily Alert: " + ", ".join(subject_bits)
+
     msg = MIMEText(body)
-    msg["Subject"] = f"🚨 Mega-Cap MR Alert: {len(scored)} opportunity(ies)"
+    msg["Subject"] = subject
     msg["From"]    = gmail_user
     msg["To"]      = recipient
 
