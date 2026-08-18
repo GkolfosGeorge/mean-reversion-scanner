@@ -1,3 +1,4 @@
 trading-shared-data @ git+https://github.com/GkolfosGeorge/shared-data-layer.git@v0.1.19
 scipy>=1.11
 matplotlib>=3.7
+scikit-learn>=1.3
