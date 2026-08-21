@@ -23,6 +23,14 @@ try:
 except ImportError:
     from regime_detector import RegimeDetector, REGIME_CONFIGS
 
+# ── Standardized metrics (Phase 2.9) — single source of truth for all
+# performance statistics, shared with rolling-windows, out-of-sample,
+# Monte Carlo, and transaction-cost-stress-test scripts. ─────────────────────
+try:
+    from trading.backtest_metrics import compute_standard_metrics
+except ImportError:
+    from backtest_metrics import compute_standard_metrics
+
 # ── MR scorer — reuses the SAME technical helpers as the live scanner ───────
 try:
     from trading.scorer_mr import (
@@ -112,6 +120,21 @@ def _compute_mr_score_at_date(
     warmup = max(_mr_period, _bb_period, _rsi_period, _volume_period) + 5
     if len(df_slice) < warmup:
         return None
+
+    # ── Performance: cap lookback instead of feeding FULL ticker history
+    # (up to 16000+ rows) into every rolling calc, at EVERY review date, for
+    # EVERY ticker. Rolling windows only ever look at their own trailing N
+    # rows, so extra history beyond `warmup` + a safety margin changes
+    # NOTHING about the .iloc[-1] result — it only makes pandas redo more
+    # work for the same answer. This is the single biggest cost in
+    # run_backtest(): O(reviews x tickers x full_history_length) before,
+    # O(reviews x tickers x MAX_LOOKBACK) after, and every downstream script
+    # that reruns run_backtest() many times (rolling windows, parameter
+    # sweep, cost stress test, Monte Carlo re-runs) inherits the speedup for
+    # free since they all just call this same function.
+    MAX_LOOKBACK = max(warmup, 320)   # 320 safely covers MR_PERIOD=252 + margin
+    if len(df_slice) > MAX_LOOKBACK:
+        df_slice = df_slice.iloc[-MAX_LOOKBACK:]
 
     close  = df_slice["Close"]
     high   = df_slice["High"]
@@ -478,8 +501,21 @@ def run_backtest(
     # ticker's own row series simply stops. This dict is the dynamic
     # replacement used below to force-close positions exactly when (not long
     # after) the underlying stock stopped trading.
+    #
+    # Performance: `data[t].dropna()` used to be recalled fresh (O(full
+    # history)) up to 7x per ticker per review date throughout the loop
+    # below. Computed ONCE here into `clean_data` and reused everywhere —
+    # turns O(reviews x tickers) dropna() calls into O(tickers).
+    #
+    # NOTE: last_valid_date intentionally keeps its ORIGINAL narrower
+    # criterion (Close-only dropna) — NOT clean_data's full-row dropna,
+    # which could drop a row for a NaN in an unrelated column (e.g. Volume)
+    # while Close was still valid, silently shifting last_valid_date earlier
+    # than before. Two separate passes, on purpose, to not change behavior.
     last_valid_date = {}
+    clean_data      = {}
     for t in available_tickers:
+        clean_data[t] = data[t].dropna()
         t_close = data[t]["Close"].dropna()
         if not t_close.empty:
             last_valid_date[t] = t_close.index.max()
@@ -606,7 +642,7 @@ def run_backtest(
             # NOW at its true last price/date instead of silently "holding"
             # a dead position until end-of-backtest.
             if lvd is not None and lvd < period_start:
-                ticker_df = data[ticker].dropna()
+                ticker_df = clean_data[ticker]
                 exit_price = ticker_df["Close"].iloc[-1]
                 to_close_stops.append((ticker, "delisted", lvd, exit_price))
                 continue
@@ -616,7 +652,7 @@ def run_backtest(
                 to_close_stops.append((ticker, "delisted", review_date, pos["entry_price"]))
                 continue
 
-            ticker_df   = data[ticker].dropna()
+            ticker_df   = clean_data[ticker]
             period_data = ticker_df[
                 (ticker_df.index > period_start) &
                 (ticker_df.index <= review_date)
@@ -662,14 +698,14 @@ def run_backtest(
 
             # Bear regime exit: liquidate all
             if cur_bear_exit:
-                ticker_df = data[ticker].dropna()
+                ticker_df = clean_data[ticker]
                 avail = ticker_df[ticker_df.index <= review_date]
                 exit_price = avail["Close"].iloc[-1] if not avail.empty else pos["entry_price"]
                 to_close_signal.append((ticker, "bear_regime_exit", review_date, exit_price))
                 continue
 
             # Score check
-            ticker_df  = data[ticker].dropna()
+            ticker_df  = clean_data[ticker]
             re_scored  = _compute_mr_score_at_date(
                 ticker_df, review_date,
                 stop_atr_mult   = cur_stop_mult,
@@ -727,7 +763,7 @@ def run_backtest(
                 if ticker in portfolio:
                     continue
                 try:
-                    ticker_df = data[ticker].dropna()
+                    ticker_df = clean_data[ticker]
 
                     if next_open_entry:
                         # Score using the trading day BEFORE review_date —
@@ -758,7 +794,7 @@ def run_backtest(
             if candidates:
                 per_slot_capital = deployable / cur_top_n
                 for ticker, result in candidates:
-                    ticker_df = data[ticker].dropna()
+                    ticker_df = clean_data[ticker]
 
                     if next_open_entry:
                         # Earliest realistic fill: review_date's Open,
@@ -875,7 +911,7 @@ def run_backtest(
     for ticker, pos in list(portfolio.items()):
         if ticker not in available_tickers:
             continue
-        ticker_df  = data[ticker].dropna()
+        ticker_df  = clean_data[ticker]
         avail      = ticker_df[ticker_df.index <= last_date]
         if avail.empty:
             continue
@@ -883,32 +919,25 @@ def run_backtest(
         all_trades.append(_close_out(pos, ticker, last_date, exit_price, "end_of_backtest"))
 
     # ── Metrics ───────────────────────────────────────────────────────────────
+    # All return/risk/trade statistics now come from the single shared
+    # backtest_metrics.compute_standard_metrics() (Phase 2.9) — this backtester
+    # only produces the raw trades_df/equity_df; it does no longer computes
+    # Sharpe/Sortino/etc. inline. See backtest_metrics.py for the exact
+    # formulas (Sharpe/Sortino/Calmar now use equity-curve periodic returns
+    # instead of trade-level pnl_pct — numbers will differ slightly, and
+    # more accurately, from older runs).
     trades_df = pd.DataFrame(all_trades)
     equity_df = pd.DataFrame(equity_curve).set_index("date")
 
-    total_return  = (capital - initial_capital) / initial_capital * 100
-    n_years       = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days / 365.25
-    annual_return = ((capital / initial_capital) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
-
-    wins    = trades_df[trades_df["pnl_pct"] > 0]  if len(trades_df) > 0 else pd.DataFrame()
-    losses  = trades_df[trades_df["pnl_pct"] <= 0] if len(trades_df) > 0 else pd.DataFrame()
-    win_rate     = len(wins) / len(trades_df) * 100 if len(trades_df) > 0 else 0
-    avg_win      = wins["pnl_pct"].mean()   if len(wins)   > 0 else 0
-    avg_loss     = losses["pnl_pct"].mean() if len(losses) > 0 else 0
-    profit_factor = (
-        (len(wins) * avg_win) / abs(len(losses) * avg_loss)
-        if len(losses) > 0 and avg_loss != 0 else 0
+    metrics = compute_standard_metrics(
+        trades_df       = trades_df,
+        equity_df       = equity_df,
+        initial_capital = initial_capital,
+        final_capital   = capital,
+        start_date      = start_date,
+        end_date        = end_date,
+        periods_per_year = 12,   # monthly review cadence
     )
-
-    equity_vals  = equity_df["portfolio_value"]
-    rolling_max  = equity_vals.cummax()
-    drawdowns    = (equity_vals - rolling_max) / rolling_max * 100
-    max_drawdown = drawdowns.min() if not drawdowns.empty else 0
-
-    sharpe = 0
-    if len(trades_df) > 1:
-        returns = trades_df["pnl_pct"] / 100
-        sharpe  = (returns.mean() / returns.std()) * np.sqrt(12) if returns.std() > 0 else 0
 
     reliability = _analyze_signal_reliability(trades_df)
 
@@ -927,18 +956,15 @@ def run_backtest(
             "mode":             mode_label,
             "initial_capital":  initial_capital,
             "final_capital":    round(capital, 2),
-            "total_return":     round(total_return, 2),
-            "annual_return":    round(annual_return, 2),
             "benchmark_ticker": benchmark_ticker,
             "benchmark_return": round(benchmark_return, 2),
-            "outperformance":   round(total_return - benchmark_return, 2),
-            "n_trades":         len(trades_df),
-            "win_rate":         round(win_rate, 2),
-            "avg_win":          round(avg_win, 2),
-            "avg_loss":         round(avg_loss, 2),
-            "profit_factor":    round(profit_factor, 2),
-            "max_drawdown":     round(max_drawdown, 2),
-            "sharpe_ratio":     round(sharpe, 2),
+            "outperformance":   round(metrics["total_return"] - benchmark_return, 2),
+            # total_return, annual_return, n_trades, win_rate, avg_win,
+            # avg_loss, profit_factor, max_drawdown, sharpe_ratio,
+            # sortino_ratio, calmar_ratio, expectancy_pct, expectancy_abs
+            # all come from backtest_metrics.compute_standard_metrics() —
+            # see that module for exact formulas.
+            **metrics,
             # v2-specific
             "exit_score_threshold": exit_score_threshold,
             "bear_regime_exit":     bear_regime_exit,
@@ -1030,10 +1056,18 @@ def print_backtest_report(results: dict) -> None:
     print(f"    Avg win:           {s['avg_win']:>+10.2f}%")
     print(f"    Avg loss:          {s['avg_loss']:>+10.2f}%")
     print(f"    Profit factor:     {s['profit_factor']:>10.2f}")
+    print(f"    Expectancy/trade:  {s.get('expectancy_pct', 0):>+9.2f}%  (€{s.get('expectancy_abs', 0):>+.2f})")
+
+    def _fmt_ratio(v):
+        # Sortino can legitimately be +inf (zero losing periods) —
+        # format that without crashing the f-string.
+        return f"{v:>10.2f}" if np.isfinite(v) else f"{'inf':>10}"
 
     print(f"\n  ⚠️  RISK")
     print(f"    Max drawdown:      {s['max_drawdown']:>+10.2f}%")
-    print(f"    Sharpe ratio:      {s['sharpe_ratio']:>10.2f}")
+    print(f"    Sharpe ratio:      {_fmt_ratio(s['sharpe_ratio'])}")
+    print(f"    Sortino ratio:     {_fmt_ratio(s.get('sortino_ratio', 0))}")
+    print(f"    Calmar ratio:      {_fmt_ratio(s.get('calmar_ratio', 0))}")
 
     if "total_transaction_costs" in s:
         print(f"\n  💸 EXECUTION & COSTS")

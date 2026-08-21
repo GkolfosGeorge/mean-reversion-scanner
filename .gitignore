@@ -10,3 +10,7 @@ options_archive/
 __pycache__/
 *.pyc
 .env
+*.doc
+*.docx
+~$*.doc
+~$*.docx
