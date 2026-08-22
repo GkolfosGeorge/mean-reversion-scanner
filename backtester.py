@@ -23,9 +23,6 @@ try:
 except ImportError:
     from regime_detector import RegimeDetector, REGIME_CONFIGS
 
-# ── Standardized metrics (Phase 2.9) — single source of truth for all
-# performance statistics, shared with rolling-windows, out-of-sample,
-# Monte Carlo, and transaction-cost-stress-test scripts. ─────────────────────
 try:
     from trading.backtest_metrics import compute_standard_metrics
 except ImportError:
@@ -44,6 +41,7 @@ try:
         RSI_MAX, MIN_AVG_VOLUME as MR_MIN_AVG_VOLUME,
         W_RSI as MR_W_RSI, W_BB as MR_W_BB, W_MR as MR_W_MR,
         W_STOCHRSI as MR_W_STOCHRSI, W_WILLIAMS as MR_W_WILLIAMS,
+        MAX_PER_SECTOR as MR_MAX_PER_SECTOR,
     )
 except ImportError:
     from scorer_mr import (
@@ -57,6 +55,7 @@ except ImportError:
         RSI_MAX, MIN_AVG_VOLUME as MR_MIN_AVG_VOLUME,
         W_RSI as MR_W_RSI, W_BB as MR_W_BB, W_MR as MR_W_MR,
         W_STOCHRSI as MR_W_STOCHRSI, W_WILLIAMS as MR_W_WILLIAMS,
+        MAX_PER_SECTOR as MR_MAX_PER_SECTOR,
     )
 
 
@@ -120,21 +119,6 @@ def _compute_mr_score_at_date(
     warmup = max(_mr_period, _bb_period, _rsi_period, _volume_period) + 5
     if len(df_slice) < warmup:
         return None
-
-    # ── Performance: cap lookback instead of feeding FULL ticker history
-    # (up to 16000+ rows) into every rolling calc, at EVERY review date, for
-    # EVERY ticker. Rolling windows only ever look at their own trailing N
-    # rows, so extra history beyond `warmup` + a safety margin changes
-    # NOTHING about the .iloc[-1] result — it only makes pandas redo more
-    # work for the same answer. This is the single biggest cost in
-    # run_backtest(): O(reviews x tickers x full_history_length) before,
-    # O(reviews x tickers x MAX_LOOKBACK) after, and every downstream script
-    # that reruns run_backtest() many times (rolling windows, parameter
-    # sweep, cost stress test, Monte Carlo re-runs) inherits the speedup for
-    # free since they all just call this same function.
-    MAX_LOOKBACK = max(warmup, 320)   # 320 safely covers MR_PERIOD=252 + margin
-    if len(df_slice) > MAX_LOOKBACK:
-        df_slice = df_slice.iloc[-MAX_LOOKBACK:]
 
     close  = df_slice["Close"]
     high   = df_slice["High"]
@@ -201,6 +185,7 @@ def _compute_mr_score_at_date(
         "signal_score":   composite,
         "price":          round(price, 2),
         "atr":            round(atr_val, 2),
+        "avg_volume":     round(avg_vol, 0) if pd.notna(avg_vol) else None,  # shares/day — used by atr_risk_based liquidity cap
         "stop_loss":      round(price - stop_atr_mult  * atr_val, 2),
         "atr_trail_stop": round(price - atr_trail_mult * atr_val, 2),
         "target_2":       round(price + target_atr_mult * atr_val, 2),
@@ -418,6 +403,19 @@ def run_backtest(
     signal_threshold:  float = 6.5,
     max_hold_days:     int   = 365,     # safety valve only
 
+    # ── Position sizing methodology (Phase 3.2) ────────────────────────────
+    # "fixed_fractional" (default, backward-compatible): allocated =
+    #   deployable / top_n, same for every new slot regardless of volatility.
+    # "atr_risk_based": sizes each position so a stop-out loses exactly
+    #   risk_per_trade_pct of capital — shares = (capital * risk_per_trade_pct)
+    #   / (stop_atr_mult * ATR). Capped by max_pct_per_position (capital cap)
+    #   and liquidity_pct_adv (% of average daily volume) so tight-ATR /
+    #   thin-liquidity tickers can't blow past realistic fill sizes.
+    sizing_method:         str   = "fixed_fractional",
+    risk_per_trade_pct:    float = 0.01,   # 1% of capital risked per trade (atr_risk_based only)
+    max_pct_per_position:  float = 0.20,   # capital cap: no position > 20% of capital (atr_risk_based only)
+    liquidity_pct_adv:     float = 0.01,   # liquidity cap: no position > 1% of avg daily volume (atr_risk_based only)
+
     # Stop logic (3-phase)
     stop_atr_mult:     float = 1.5,    # legacy: unused in the 3-phase logic
     target_atr_mult:   float = 4.0,
@@ -445,6 +443,25 @@ def run_backtest(
     # new candidates are restricted to actual index members on the
     # review_date. None = old behavior (backward-compatible).
     membership:        pd.DataFrame | None = None,
+
+    # ── Sector diversification (Phase 3.1) ──────────────────────────────────
+    # Opt-in: pass {ticker: sector} (e.g. from sector_lookup.get_sectors_and_caps)
+    # to enforce the SAME MAX_PER_SECTOR cap the live scanner already applies.
+    # None (default) = old behavior, no sector cap in the backtest — matches
+    # every Phase 2 result already on record.
+    sectors:            dict | None = None,
+    max_per_sector:     int   = MR_MAX_PER_SECTOR,
+
+    # ── Correlation-aware position limits (Phase 3.4) ────────────────────────
+    # Opt-in: rejects a candidate whose recent daily-return correlation with
+    # any ALREADY-HELD position (or an already-accepted candidate this same
+    # pass) exceeds max_pairwise_correlation. Catches same-factor exposure
+    # that sector labels alone can miss (e.g. two different-sector mega-caps
+    # that move together on rate expectations). None (default) = filter OFF,
+    # backward-compatible with every Phase 2/3.1-3.3 result already on record.
+    max_pairwise_correlation:  float | None = None,
+    correlation_lookback_days: int   = 60,
+    correlation_min_obs:       int   = 20,   # min overlapping return obs to trust the correlation
 
     # ── Execution realism ─────────────────────────────────────────────────
     # Adverse slippage applied to EVERY fill (entries pay more, exits get
@@ -474,6 +491,9 @@ def run_backtest(
     if end_date is None:
         end_date = data.index[-1].strftime("%Y-%m-%d")
 
+    if sizing_method not in ("fixed_fractional", "atr_risk_based"):
+        raise ValueError(f"sizing_method must be 'fixed_fractional' or 'atr_risk_based', got {sizing_method!r}")
+
     use_regime  = regime_detector is not None
     mode_label  = "v3-mr-signal-exit"
     if use_regime:
@@ -481,6 +501,11 @@ def run_backtest(
 
     print(f"\n🔄 Backtesting: {start_date} → {end_date}  [{mode_label}]")
     print(f"   Top {top_n} | Threshold: {signal_threshold} | Exit threshold: {exit_score_threshold}")
+    if sizing_method == "atr_risk_based":
+        print(f"   Sizing: atr_risk_based | risk/trade={risk_per_trade_pct*100:.2f}% | "
+              f"max/position={max_pct_per_position*100:.0f}% | liquidity cap={liquidity_pct_adv*100:.2f}% ADV")
+    else:
+        print(f"   Sizing: fixed_fractional (equal-weight across {top_n} slots)")
     print(f"   3-phase stop: guard={guard_days}d hard={hard_floor_atr}×ATR trail={atr_trail_mult}×ATR trigger=+{trail_trigger_atr}×ATR")
     print(f"   Bear regime exit: {bear_regime_exit}")
     print(
@@ -501,21 +526,8 @@ def run_backtest(
     # ticker's own row series simply stops. This dict is the dynamic
     # replacement used below to force-close positions exactly when (not long
     # after) the underlying stock stopped trading.
-    #
-    # Performance: `data[t].dropna()` used to be recalled fresh (O(full
-    # history)) up to 7x per ticker per review date throughout the loop
-    # below. Computed ONCE here into `clean_data` and reused everywhere —
-    # turns O(reviews x tickers) dropna() calls into O(tickers).
-    #
-    # NOTE: last_valid_date intentionally keeps its ORIGINAL narrower
-    # criterion (Close-only dropna) — NOT clean_data's full-row dropna,
-    # which could drop a row for a NaN in an unrelated column (e.g. Volume)
-    # while Close was still valid, silently shifting last_valid_date earlier
-    # than before. Two separate passes, on purpose, to not change behavior.
     last_valid_date = {}
-    clean_data      = {}
     for t in available_tickers:
-        clean_data[t] = data[t].dropna()
         t_close = data[t]["Close"].dropna()
         if not t_close.empty:
             last_valid_date[t] = t_close.index.max()
@@ -525,6 +537,16 @@ def run_backtest(
         print(f"   Point-in-time universe: ACTIVE ({len(membership_intervals)} tickers in membership table)")
     else:
         print(f"   Point-in-time universe: INACTIVE (membership=None — all {len(available_tickers)} tickers are always considered available for new positions)")
+
+    if sectors is not None:
+        print(f"   Sector diversification: ACTIVE (max {max_per_sector} positions/sector, {len(sectors)} tickers mapped)")
+    else:
+        print(f"   Sector diversification: INACTIVE (sectors=None — no cap applied, same as all prior Phase 2 runs)")
+
+    if max_pairwise_correlation is not None:
+        print(f"   Correlation filter: ACTIVE (max |corr|={max_pairwise_correlation:.2f}, lookback={correlation_lookback_days}d)")
+    else:
+        print(f"   Correlation filter: INACTIVE (max_pairwise_correlation=None — no cap applied)")
 
     # ── Warm-up guard ─────────────────────────────────────────────────────────
     # 252 days (1 year) comfortably covers MR_PERIOD (z-score) and all
@@ -642,7 +664,7 @@ def run_backtest(
             # NOW at its true last price/date instead of silently "holding"
             # a dead position until end-of-backtest.
             if lvd is not None and lvd < period_start:
-                ticker_df = clean_data[ticker]
+                ticker_df = data[ticker].dropna()
                 exit_price = ticker_df["Close"].iloc[-1]
                 to_close_stops.append((ticker, "delisted", lvd, exit_price))
                 continue
@@ -652,7 +674,7 @@ def run_backtest(
                 to_close_stops.append((ticker, "delisted", review_date, pos["entry_price"]))
                 continue
 
-            ticker_df   = clean_data[ticker]
+            ticker_df   = data[ticker].dropna()
             period_data = ticker_df[
                 (ticker_df.index > period_start) &
                 (ticker_df.index <= review_date)
@@ -698,14 +720,14 @@ def run_backtest(
 
             # Bear regime exit: liquidate all
             if cur_bear_exit:
-                ticker_df = clean_data[ticker]
+                ticker_df = data[ticker].dropna()
                 avail = ticker_df[ticker_df.index <= review_date]
                 exit_price = avail["Close"].iloc[-1] if not avail.empty else pos["entry_price"]
                 to_close_signal.append((ticker, "bear_regime_exit", review_date, exit_price))
                 continue
 
             # Score check
-            ticker_df  = clean_data[ticker]
+            ticker_df  = data[ticker].dropna()
             re_scored  = _compute_mr_score_at_date(
                 ticker_df, review_date,
                 stop_atr_mult   = cur_stop_mult,
@@ -763,7 +785,7 @@ def run_backtest(
                 if ticker in portfolio:
                     continue
                 try:
-                    ticker_df = clean_data[ticker]
+                    ticker_df = data[ticker].dropna()
 
                     if next_open_entry:
                         # Score using the trading day BEFORE review_date —
@@ -789,12 +811,79 @@ def run_backtest(
                     continue
 
             scored.sort(key=lambda x: x[1]["signal_score"], reverse=True)
-            candidates = scored[:slots_available]
+
+            # ── Diversified selection (sector cap Phase 3.1 + correlation
+            # filter Phase 3.4, applied together) ────────────────────────────
+            correlation_active = max_pairwise_correlation is not None
+
+            sector_counts: dict[str, int] = {}
+            if sectors is not None:
+                for pos in portfolio.values():
+                    sec = pos.get("sector", "Unknown")
+                    sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
+            # Tickers whose correlation a new candidate must clear: currently
+            # HELD positions, growing as candidates get accepted this pass
+            # (so two highly-correlated NEW candidates can't both slip in).
+            corr_check_tickers = list(portfolio.keys()) if correlation_active else []
+            _returns_cache: dict = {}
+
+            def _recent_returns(ticker: str):
+                if ticker in _returns_cache:
+                    return _returns_cache[ticker]
+                try:
+                    closes = data[ticker]["Close"].dropna()
+                    closes = closes[closes.index <= review_date]
+                    if len(closes) < correlation_lookback_days + 1:
+                        ret = None
+                    else:
+                        ret = closes.iloc[-(correlation_lookback_days + 1):].pct_change().dropna()
+                except Exception:
+                    ret = None
+                _returns_cache[ticker] = ret
+                return ret
+
+            candidates = []
+            if sectors is None and not correlation_active:
+                candidates = scored[:slots_available]
+            else:
+                for ticker, result in scored:
+                    if len(candidates) >= slots_available:
+                        break
+
+                    if sectors is not None:
+                        sec = sectors.get(ticker, "Unknown")
+                        if sector_counts.get(sec, 0) >= max_per_sector:
+                            continue
+
+                    if correlation_active:
+                        cand_ret = _recent_returns(ticker)
+                        too_correlated = False
+                        if cand_ret is not None:
+                            for held_t in corr_check_tickers:
+                                held_ret = _recent_returns(held_t)
+                                if held_ret is None:
+                                    continue
+                                aligned = pd.concat([cand_ret, held_ret], axis=1).dropna()
+                                if len(aligned) >= correlation_min_obs:
+                                    corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+                                    if pd.notna(corr) and abs(corr) > max_pairwise_correlation:
+                                        too_correlated = True
+                                        break
+                        if too_correlated:
+                            continue
+
+                    candidates.append((ticker, result))
+                    if sectors is not None:
+                        sec = sectors.get(ticker, "Unknown")
+                        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+                    if correlation_active:
+                        corr_check_tickers.append(ticker)
 
             if candidates:
                 per_slot_capital = deployable / cur_top_n
                 for ticker, result in candidates:
-                    ticker_df = clean_data[ticker]
+                    ticker_df = data[ticker].dropna()
 
                     if next_open_entry:
                         # Earliest realistic fill: review_date's Open,
@@ -810,14 +899,42 @@ def run_backtest(
 
                     # Adverse slippage: always pay a touch more than quoted.
                     entry_price = raw_entry_price * (1 + slippage_pct)
+                    atr_val     = result["atr"]
 
-                    # Score-weighted, but only among the new slots
-                    allocated = min(deployable / cur_top_n, capital * (1 - cur_cash_pct))
+                    if sizing_method == "atr_risk_based":
+                        # 1) Risk-based: size so a stop-out costs exactly
+                        #    risk_per_trade_pct of current capital.
+                        stop_distance = cur_stop_mult * atr_val
+                        if stop_distance <= 0:
+                            continue
+                        risk_dollars       = capital * risk_per_trade_pct
+                        risk_based_shares  = risk_dollars / stop_distance
 
-                    if allocated <= 0:
-                        continue
+                        # 2) Capital cap: no single position > max_pct_per_position
+                        #    of capital, however tight the stop is.
+                        capital_cap_shares = (max_pct_per_position * capital) / entry_price
 
-                    shares      = allocated / entry_price
+                        # 3) Liquidity cap: no position > liquidity_pct_adv of
+                        #    the ticker's average daily volume (skip cap if
+                        #    avg_volume unavailable rather than block the trade).
+                        avg_vol = result.get("avg_volume")
+                        liquidity_cap_shares = (
+                            liquidity_pct_adv * avg_vol if avg_vol else float("inf")
+                        )
+
+                        shares = min(risk_based_shares, capital_cap_shares, liquidity_cap_shares)
+                        # Still can't spend more than what's actually free this pass.
+                        shares = min(shares, deployable / entry_price) if deployable > 0 else 0
+                        if shares <= 0:
+                            continue
+                    else:
+                        # fixed_fractional (default, backward-compatible):
+                        # equal dollar allocation across the top_n slots.
+                        allocated = min(deployable / cur_top_n, capital * (1 - cur_cash_pct))
+                        if allocated <= 0:
+                            continue
+                        shares = allocated / entry_price
+
                     trade_value = shares * entry_price
                     commission  = _ib_commission(shares, entry_price, commission_per_share, commission_min, commission_max_pct)
                     cumulative_costs += commission
@@ -827,10 +944,10 @@ def run_backtest(
                         capital -= commission
                     n_new_opens += 1
 
-                    atr_val = result["atr"]
                     portfolio[ticker] = {
                         "shares":            shares,
                         "entry_price":       entry_price,
+                        "sector":            sectors.get(ticker, "Unknown") if sectors is not None else "Unknown",
                         # Stop/target recentred on the ACTUAL fill price
                         # (result["price"] was yesterday's close, not what
                         # we paid) — ATR itself is still the point-in-time
@@ -888,6 +1005,12 @@ def run_backtest(
             "regime":          regime_name,
             "n_positions":     len(portfolio),
             "n_new":           n_new_opens,
+            # Phase 3.3 — exposure audit: how much of the portfolio is
+            # actually invested right now vs sitting in cash. Not enforced
+            # (cash_pct only gates NEW entries, doesn't trim winners back
+            # to target), but visible here so drift is auditable.
+            "pct_invested":    round((port_value - capital) / port_value * 100, 1) if port_value > 0 else 0.0,
+            "cash_pct_target": round(cur_cash_pct * 100, 1),
         })
 
         freeze_tag = "" if entry_allowed else " 🔴CB"
@@ -911,21 +1034,17 @@ def run_backtest(
     for ticker, pos in list(portfolio.items()):
         if ticker not in available_tickers:
             continue
-        ticker_df  = clean_data[ticker]
+        ticker_df  = data[ticker].dropna()
         avail      = ticker_df[ticker_df.index <= last_date]
         if avail.empty:
             continue
         exit_price = avail["Close"].iloc[-1]
         all_trades.append(_close_out(pos, ticker, last_date, exit_price, "end_of_backtest"))
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
-    # All return/risk/trade statistics now come from the single shared
-    # backtest_metrics.compute_standard_metrics() (Phase 2.9) — this backtester
-    # only produces the raw trades_df/equity_df; it does no longer computes
-    # Sharpe/Sortino/etc. inline. See backtest_metrics.py for the exact
-    # formulas (Sharpe/Sortino/Calmar now use equity-curve periodic returns
-    # instead of trade-level pnl_pct — numbers will differ slightly, and
-    # more accurately, from older runs).
+    # ── Metrics — single source of truth via backtest_metrics.py (Phase 2.9) ──
+    # Same function used by out_of_sample.py, monte_carlo.py, cost_stress_test.py,
+    # parameter_sweep.py, equal_weight_benchmark.py — so every number here is
+    # directly comparable across the whole roadmap, not just within this file.
     trades_df = pd.DataFrame(all_trades)
     equity_df = pd.DataFrame(equity_curve).set_index("date")
 
@@ -959,11 +1078,21 @@ def run_backtest(
             "benchmark_ticker": benchmark_ticker,
             "benchmark_return": round(benchmark_return, 2),
             "outperformance":   round(metrics["total_return"] - benchmark_return, 2),
-            # total_return, annual_return, n_trades, win_rate, avg_win,
-            # avg_loss, profit_factor, max_drawdown, sharpe_ratio,
-            # sortino_ratio, calmar_ratio, expectancy_pct, expectancy_abs
-            # all come from backtest_metrics.compute_standard_metrics() —
-            # see that module for exact formulas.
+            # Position sizing (Phase 3.2)
+            "sizing_method":         sizing_method,
+            "risk_per_trade_pct":    risk_per_trade_pct   if sizing_method == "atr_risk_based" else None,
+            "max_pct_per_position":  max_pct_per_position if sizing_method == "atr_risk_based" else None,
+            "liquidity_pct_adv":     liquidity_pct_adv    if sizing_method == "atr_risk_based" else None,
+            # Sector diversification (Phase 3.1)
+            "sector_cap_active":     sectors is not None,
+            "max_per_sector":        max_per_sector if sectors is not None else None,
+            # Correlation-aware limits (Phase 3.4)
+            "correlation_filter_active":  max_pairwise_correlation is not None,
+            "max_pairwise_correlation":   max_pairwise_correlation,
+            "correlation_lookback_days":  correlation_lookback_days if max_pairwise_correlation is not None else None,
+            # Standardized metrics (Phase 2.9) — total_return, annual_return,
+            # max_drawdown, sharpe/sortino/calmar_ratio, win_rate, avg_win,
+            # avg_loss, profit_factor, expectancy_pct, expectancy_abs, n_trades
             **metrics,
             # v2-specific
             "exit_score_threshold": exit_score_threshold,
@@ -1040,6 +1169,12 @@ def print_backtest_report(results: dict) -> None:
           f"trigger=+{s.get('trail_trigger_atr')}×ATR")
     print(f"  Bear exit: {s.get('bear_regime_exit')} | "
           f"Exit score threshold: {s.get('exit_score_threshold')}")
+    if s.get("sizing_method") == "atr_risk_based":
+        print(f"  Sizing: atr_risk_based | risk/trade={s.get('risk_per_trade_pct', 0)*100:.2f}% | "
+              f"max/position={s.get('max_pct_per_position', 0)*100:.0f}% | "
+              f"liquidity cap={s.get('liquidity_pct_adv', 0)*100:.2f}% ADV")
+    else:
+        print(f"  Sizing: {s.get('sizing_method', 'fixed_fractional')}")
     print(f"{'═'*60}")
 
     print(f"\n  💰 PERFORMANCE")
@@ -1056,18 +1191,13 @@ def print_backtest_report(results: dict) -> None:
     print(f"    Avg win:           {s['avg_win']:>+10.2f}%")
     print(f"    Avg loss:          {s['avg_loss']:>+10.2f}%")
     print(f"    Profit factor:     {s['profit_factor']:>10.2f}")
-    print(f"    Expectancy/trade:  {s.get('expectancy_pct', 0):>+9.2f}%  (€{s.get('expectancy_abs', 0):>+.2f})")
-
-    def _fmt_ratio(v):
-        # Sortino can legitimately be +inf (zero losing periods) —
-        # format that without crashing the f-string.
-        return f"{v:>10.2f}" if np.isfinite(v) else f"{'inf':>10}"
 
     print(f"\n  ⚠️  RISK")
     print(f"    Max drawdown:      {s['max_drawdown']:>+10.2f}%")
-    print(f"    Sharpe ratio:      {_fmt_ratio(s['sharpe_ratio'])}")
-    print(f"    Sortino ratio:     {_fmt_ratio(s.get('sortino_ratio', 0))}")
-    print(f"    Calmar ratio:      {_fmt_ratio(s.get('calmar_ratio', 0))}")
+    print(f"    Sharpe ratio:      {s['sharpe_ratio']:>10.2f}")
+    print(f"    Sortino ratio:     {s.get('sortino_ratio', 0):>10.2f}")
+    print(f"    Calmar ratio:      {s.get('calmar_ratio', 0):>10.2f}")
+    print(f"    Expectancy:        {s.get('expectancy_pct', 0):>+9.2f}%")
 
     if "total_transaction_costs" in s:
         print(f"\n  💸 EXECUTION & COSTS")
