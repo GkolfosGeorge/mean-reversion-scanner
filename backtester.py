@@ -23,11 +23,6 @@ try:
 except ImportError:
     from regime_detector import RegimeDetector, REGIME_CONFIGS
 
-try:
-    from trading.backtest_metrics import compute_standard_metrics
-except ImportError:
-    from backtest_metrics import compute_standard_metrics
-
 # ── MR scorer — reuses the SAME technical helpers as the live scanner ───────
 try:
     from trading.scorer_mr import (
@@ -41,7 +36,6 @@ try:
         RSI_MAX, MIN_AVG_VOLUME as MR_MIN_AVG_VOLUME,
         W_RSI as MR_W_RSI, W_BB as MR_W_BB, W_MR as MR_W_MR,
         W_STOCHRSI as MR_W_STOCHRSI, W_WILLIAMS as MR_W_WILLIAMS,
-        MAX_PER_SECTOR as MR_MAX_PER_SECTOR,
     )
 except ImportError:
     from scorer_mr import (
@@ -55,7 +49,6 @@ except ImportError:
         RSI_MAX, MIN_AVG_VOLUME as MR_MIN_AVG_VOLUME,
         W_RSI as MR_W_RSI, W_BB as MR_W_BB, W_MR as MR_W_MR,
         W_STOCHRSI as MR_W_STOCHRSI, W_WILLIAMS as MR_W_WILLIAMS,
-        MAX_PER_SECTOR as MR_MAX_PER_SECTOR,
     )
 
 
@@ -185,7 +178,6 @@ def _compute_mr_score_at_date(
         "signal_score":   composite,
         "price":          round(price, 2),
         "atr":            round(atr_val, 2),
-        "avg_volume":     round(avg_vol, 0) if pd.notna(avg_vol) else None,  # shares/day — used by atr_risk_based liquidity cap
         "stop_loss":      round(price - stop_atr_mult  * atr_val, 2),
         "atr_trail_stop": round(price - atr_trail_mult * atr_val, 2),
         "target_2":       round(price + target_atr_mult * atr_val, 2),
@@ -403,18 +395,17 @@ def run_backtest(
     signal_threshold:  float = 6.5,
     max_hold_days:     int   = 365,     # safety valve only
 
-    # ── Position sizing methodology (Phase 3.2) ────────────────────────────
-    # "fixed_fractional" (default, backward-compatible): allocated =
-    #   deployable / top_n, same for every new slot regardless of volatility.
-    # "atr_risk_based": sizes each position so a stop-out loses exactly
-    #   risk_per_trade_pct of capital — shares = (capital * risk_per_trade_pct)
-    #   / (stop_atr_mult * ATR). Capped by max_pct_per_position (capital cap)
-    #   and liquidity_pct_adv (% of average daily volume) so tight-ATR /
-    #   thin-liquidity tickers can't blow past realistic fill sizes.
-    sizing_method:         str   = "fixed_fractional",
-    risk_per_trade_pct:    float = 0.01,   # 1% of capital risked per trade (atr_risk_based only)
-    max_pct_per_position:  float = 0.20,   # capital cap: no position > 20% of capital (atr_risk_based only)
-    liquidity_pct_adv:     float = 0.01,   # liquidity cap: no position > 1% of avg daily volume (atr_risk_based only)
+    # ── Regime-based position sizing tilt (Phase 4.7) ──────────────────────
+    # Soft size adjustment based on the dispersion axis (broad vs not-broad
+    # market participation), INDEPENDENT of the composite bull/neutral/bear
+    # regime's own top_n/cash_pct. Off by default (backward-compatible) —
+    # only takes effect when regime_detector is provided AND this is True.
+    # Validated in Phase 4.5: broad-dispersion trades outperform not-broad
+    # ones consistently (23/26 rolling windows, confound-checked within
+    # bull-only trades too) — this is a soft tilt, not a hard exclusion,
+    # since not-broad trades remain net profitable, just weaker.
+    use_dispersion_sizing:  bool = False,
+    dispersion_size_mult:   dict | None = None,   # {"broad": 1.0, "neutral": 1.0, "narrow": 0.7} if None
 
     # Stop logic (3-phase)
     stop_atr_mult:     float = 1.5,    # legacy: unused in the 3-phase logic
@@ -444,25 +435,6 @@ def run_backtest(
     # review_date. None = old behavior (backward-compatible).
     membership:        pd.DataFrame | None = None,
 
-    # ── Sector diversification (Phase 3.1) ──────────────────────────────────
-    # Opt-in: pass {ticker: sector} (e.g. from sector_lookup.get_sectors_and_caps)
-    # to enforce the SAME MAX_PER_SECTOR cap the live scanner already applies.
-    # None (default) = old behavior, no sector cap in the backtest — matches
-    # every Phase 2 result already on record.
-    sectors:            dict | None = None,
-    max_per_sector:     int   = MR_MAX_PER_SECTOR,
-
-    # ── Correlation-aware position limits (Phase 3.4) ────────────────────────
-    # Opt-in: rejects a candidate whose recent daily-return correlation with
-    # any ALREADY-HELD position (or an already-accepted candidate this same
-    # pass) exceeds max_pairwise_correlation. Catches same-factor exposure
-    # that sector labels alone can miss (e.g. two different-sector mega-caps
-    # that move together on rate expectations). None (default) = filter OFF,
-    # backward-compatible with every Phase 2/3.1-3.3 result already on record.
-    max_pairwise_correlation:  float | None = None,
-    correlation_lookback_days: int   = 60,
-    correlation_min_obs:       int   = 20,   # min overlapping return obs to trust the correlation
-
     # ── Execution realism ─────────────────────────────────────────────────
     # Adverse slippage applied to EVERY fill (entries pay more, exits get
     # less) — fixes the artificial "exactly 0.00%" clustering produced by
@@ -491,23 +463,60 @@ def run_backtest(
     if end_date is None:
         end_date = data.index[-1].strftime("%Y-%m-%d")
 
-    if sizing_method not in ("fixed_fractional", "atr_risk_based"):
-        raise ValueError(f"sizing_method must be 'fixed_fractional' or 'atr_risk_based', got {sizing_method!r}")
-
     use_regime  = regime_detector is not None
     mode_label  = "v3-mr-signal-exit"
     if use_regime:
         mode_label += "-regime"
 
+    # ── Dispersion sizing setup (Phase 4.7) ─────────────────────────────────
+    # IMPORTANT: uses the 3-way bucket (broad/neutral/narrow), NOT the
+    # 2-bucket broad/not_broad merge used during Phase 4.5 validation. That
+    # merge was a statistical-power trick for the confound check (pooling
+    # neutral+narrow gave a bigger sample to test against broad) — it does
+    # NOT mean neutral should be penalized in production sizing. Pooled data
+    # showed neutral is the MOST COMMON dispersion state (438/830 unique
+    # trades) with a perfectly reasonable avg_pnl (+1.54%, close to narrow's
+    # +2.00%). A first live test using the 2-bucket mapping (discounting
+    # neutral+narrow together) cut total return by ~19pp with an UNCHANGED
+    # Sharpe (0.71 both ways) — i.e. pure de-leveraging (idle cash sitting
+    # out most months) with zero risk-adjusted benefit. Only "narrow"
+    # (dispersion=bear, the genuinely concentrated/mega-cap-melt-up regime)
+    # is discounted here.
+    DEFAULT_DISPERSION_SIZE_MULT = {"broad": 1.0, "neutral": 1.0, "narrow": 0.70}
+    _dispersion_mult_cfg = dispersion_size_mult or DEFAULT_DISPERSION_SIZE_MULT
+    if dispersion_size_mult is not None:
+        _expected_keys = {"broad", "neutral", "narrow"}
+        _missing = _expected_keys - set(dispersion_size_mult.keys())
+        if _missing:
+            print(f"   ⚠️  dispersion_size_mult is missing key(s) {_missing} — those "
+                  f"buckets will silently get multiplier=1.0 (no size change) instead "
+                  f"of the value you may have intended. Expected keys: {_expected_keys}.")
+    _dispersion_lookup = None
+    if use_regime and use_dispersion_sizing:
+        _components = regime_detector.get_components()
+        if _components is not None and "dispersion_signal" in _components.columns:
+            _dispersion_lookup = _components["dispersion_signal"].dropna()
+        else:
+            print("   ⚠️  use_dispersion_sizing=True but regime_detector has no "
+                  "dispersion_signal (older detector version?) — sizing tilt disabled.")
+
+    def _dispersion_bucket_asof(as_of_date) -> str:
+        """Last known dispersion_signal at/before as_of_date -> broad/neutral/narrow."""
+        if _dispersion_lookup is None:
+            return "n/a"   # dispersion_size_mult.get("n/a", 1.0) -> no-op multiplier
+        idx = _dispersion_lookup.index[_dispersion_lookup.index <= as_of_date]
+        if len(idx) == 0:
+            return "n/a"
+        raw = _dispersion_lookup.loc[idx[-1]]
+        return {"bull": "broad", "neutral": "neutral", "bear": "narrow"}.get(raw, "n/a")
+
     print(f"\n🔄 Backtesting: {start_date} → {end_date}  [{mode_label}]")
     print(f"   Top {top_n} | Threshold: {signal_threshold} | Exit threshold: {exit_score_threshold}")
-    if sizing_method == "atr_risk_based":
-        print(f"   Sizing: atr_risk_based | risk/trade={risk_per_trade_pct*100:.2f}% | "
-              f"max/position={max_pct_per_position*100:.0f}% | liquidity cap={liquidity_pct_adv*100:.2f}% ADV")
-    else:
-        print(f"   Sizing: fixed_fractional (equal-weight across {top_n} slots)")
     print(f"   3-phase stop: guard={guard_days}d hard={hard_floor_atr}×ATR trail={atr_trail_mult}×ATR trigger=+{trail_trigger_atr}×ATR")
     print(f"   Bear regime exit: {bear_regime_exit}")
+    if use_dispersion_sizing:
+        status = "ACTIVE" if _dispersion_lookup is not None else "requested but unavailable"
+        print(f"   Dispersion sizing tilt: {status}  {_dispersion_mult_cfg}")
     print(
         f"   Execution: slippage={slippage_pct*100:.2f}% | "
         f"entry={'next-day open' if next_open_entry else 'same-day close'} | "
@@ -537,16 +546,6 @@ def run_backtest(
         print(f"   Point-in-time universe: ACTIVE ({len(membership_intervals)} tickers in membership table)")
     else:
         print(f"   Point-in-time universe: INACTIVE (membership=None — all {len(available_tickers)} tickers are always considered available for new positions)")
-
-    if sectors is not None:
-        print(f"   Sector diversification: ACTIVE (max {max_per_sector} positions/sector, {len(sectors)} tickers mapped)")
-    else:
-        print(f"   Sector diversification: INACTIVE (sectors=None — no cap applied, same as all prior Phase 2 runs)")
-
-    if max_pairwise_correlation is not None:
-        print(f"   Correlation filter: ACTIVE (max |corr|={max_pairwise_correlation:.2f}, lookback={correlation_lookback_days}d)")
-    else:
-        print(f"   Correlation filter: INACTIVE (max_pairwise_correlation=None — no cap applied)")
 
     # ── Warm-up guard ─────────────────────────────────────────────────────────
     # 252 days (1 year) comfortably covers MR_PERIOD (z-score) and all
@@ -811,74 +810,7 @@ def run_backtest(
                     continue
 
             scored.sort(key=lambda x: x[1]["signal_score"], reverse=True)
-
-            # ── Diversified selection (sector cap Phase 3.1 + correlation
-            # filter Phase 3.4, applied together) ────────────────────────────
-            correlation_active = max_pairwise_correlation is not None
-
-            sector_counts: dict[str, int] = {}
-            if sectors is not None:
-                for pos in portfolio.values():
-                    sec = pos.get("sector", "Unknown")
-                    sector_counts[sec] = sector_counts.get(sec, 0) + 1
-
-            # Tickers whose correlation a new candidate must clear: currently
-            # HELD positions, growing as candidates get accepted this pass
-            # (so two highly-correlated NEW candidates can't both slip in).
-            corr_check_tickers = list(portfolio.keys()) if correlation_active else []
-            _returns_cache: dict = {}
-
-            def _recent_returns(ticker: str):
-                if ticker in _returns_cache:
-                    return _returns_cache[ticker]
-                try:
-                    closes = data[ticker]["Close"].dropna()
-                    closes = closes[closes.index <= review_date]
-                    if len(closes) < correlation_lookback_days + 1:
-                        ret = None
-                    else:
-                        ret = closes.iloc[-(correlation_lookback_days + 1):].pct_change().dropna()
-                except Exception:
-                    ret = None
-                _returns_cache[ticker] = ret
-                return ret
-
-            candidates = []
-            if sectors is None and not correlation_active:
-                candidates = scored[:slots_available]
-            else:
-                for ticker, result in scored:
-                    if len(candidates) >= slots_available:
-                        break
-
-                    if sectors is not None:
-                        sec = sectors.get(ticker, "Unknown")
-                        if sector_counts.get(sec, 0) >= max_per_sector:
-                            continue
-
-                    if correlation_active:
-                        cand_ret = _recent_returns(ticker)
-                        too_correlated = False
-                        if cand_ret is not None:
-                            for held_t in corr_check_tickers:
-                                held_ret = _recent_returns(held_t)
-                                if held_ret is None:
-                                    continue
-                                aligned = pd.concat([cand_ret, held_ret], axis=1).dropna()
-                                if len(aligned) >= correlation_min_obs:
-                                    corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-                                    if pd.notna(corr) and abs(corr) > max_pairwise_correlation:
-                                        too_correlated = True
-                                        break
-                        if too_correlated:
-                            continue
-
-                    candidates.append((ticker, result))
-                    if sectors is not None:
-                        sec = sectors.get(ticker, "Unknown")
-                        sector_counts[sec] = sector_counts.get(sec, 0) + 1
-                    if correlation_active:
-                        corr_check_tickers.append(ticker)
+            candidates = scored[:slots_available]
 
             if candidates:
                 per_slot_capital = deployable / cur_top_n
@@ -899,42 +831,25 @@ def run_backtest(
 
                     # Adverse slippage: always pay a touch more than quoted.
                     entry_price = raw_entry_price * (1 + slippage_pct)
-                    atr_val     = result["atr"]
 
-                    if sizing_method == "atr_risk_based":
-                        # 1) Risk-based: size so a stop-out costs exactly
-                        #    risk_per_trade_pct of current capital.
-                        stop_distance = cur_stop_mult * atr_val
-                        if stop_distance <= 0:
-                            continue
-                        risk_dollars       = capital * risk_per_trade_pct
-                        risk_based_shares  = risk_dollars / stop_distance
+                    # Score-weighted, but only among the new slots
+                    allocated = min(deployable / cur_top_n, capital * (1 - cur_cash_pct))
 
-                        # 2) Capital cap: no single position > max_pct_per_position
-                        #    of capital, however tight the stop is.
-                        capital_cap_shares = (max_pct_per_position * capital) / entry_price
+                    # Phase 4.7: soft size tilt based on dispersion axis at entry.
+                    # Independent of the composite regime's own top_n/cash_pct —
+                    # this only scales THIS position's slot, unused capital
+                    # simply stays in cash (doesn't get redistributed to peers).
+                    disp_bucket_at_entry = "n/a"
+                    size_mult_at_entry   = 1.0
+                    if use_regime and use_dispersion_sizing:
+                        disp_bucket_at_entry = _dispersion_bucket_asof(review_date)
+                        size_mult_at_entry   = _dispersion_mult_cfg.get(disp_bucket_at_entry, 1.0)
+                        allocated *= size_mult_at_entry
 
-                        # 3) Liquidity cap: no position > liquidity_pct_adv of
-                        #    the ticker's average daily volume (skip cap if
-                        #    avg_volume unavailable rather than block the trade).
-                        avg_vol = result.get("avg_volume")
-                        liquidity_cap_shares = (
-                            liquidity_pct_adv * avg_vol if avg_vol else float("inf")
-                        )
+                    if allocated <= 0:
+                        continue
 
-                        shares = min(risk_based_shares, capital_cap_shares, liquidity_cap_shares)
-                        # Still can't spend more than what's actually free this pass.
-                        shares = min(shares, deployable / entry_price) if deployable > 0 else 0
-                        if shares <= 0:
-                            continue
-                    else:
-                        # fixed_fractional (default, backward-compatible):
-                        # equal dollar allocation across the top_n slots.
-                        allocated = min(deployable / cur_top_n, capital * (1 - cur_cash_pct))
-                        if allocated <= 0:
-                            continue
-                        shares = allocated / entry_price
-
+                    shares      = allocated / entry_price
                     trade_value = shares * entry_price
                     commission  = _ib_commission(shares, entry_price, commission_per_share, commission_min, commission_max_pct)
                     cumulative_costs += commission
@@ -944,10 +859,10 @@ def run_backtest(
                         capital -= commission
                     n_new_opens += 1
 
+                    atr_val = result["atr"]
                     portfolio[ticker] = {
                         "shares":            shares,
                         "entry_price":       entry_price,
-                        "sector":            sectors.get(ticker, "Unknown") if sectors is not None else "Unknown",
                         # Stop/target recentred on the ACTUAL fill price
                         # (result["price"] was yesterday's close, not what
                         # we paid) — ATR itself is still the point-in-time
@@ -960,6 +875,8 @@ def run_backtest(
                         "entry_date":        review_date,
                         "signal_score":      result["signal_score"],
                         "regime":            regime_name,
+                        "dispersion_bucket": disp_bucket_at_entry,   # Phase 4.7 audit trail
+                        "size_mult":         size_mult_at_entry,     # Phase 4.7 audit trail
                         "use_trail_stop":    cur_use_pct_trail,
                         "use_atr_trail":     cur_use_atr_trail,
                         "trail_pct":         trail_pct,
@@ -1005,12 +922,6 @@ def run_backtest(
             "regime":          regime_name,
             "n_positions":     len(portfolio),
             "n_new":           n_new_opens,
-            # Phase 3.3 — exposure audit: how much of the portfolio is
-            # actually invested right now vs sitting in cash. Not enforced
-            # (cash_pct only gates NEW entries, doesn't trim winners back
-            # to target), but visible here so drift is auditable.
-            "pct_invested":    round((port_value - capital) / port_value * 100, 1) if port_value > 0 else 0.0,
-            "cash_pct_target": round(cur_cash_pct * 100, 1),
         })
 
         freeze_tag = "" if entry_allowed else " 🔴CB"
@@ -1041,22 +952,33 @@ def run_backtest(
         exit_price = avail["Close"].iloc[-1]
         all_trades.append(_close_out(pos, ticker, last_date, exit_price, "end_of_backtest"))
 
-    # ── Metrics — single source of truth via backtest_metrics.py (Phase 2.9) ──
-    # Same function used by out_of_sample.py, monte_carlo.py, cost_stress_test.py,
-    # parameter_sweep.py, equal_weight_benchmark.py — so every number here is
-    # directly comparable across the whole roadmap, not just within this file.
+    # ── Metrics ───────────────────────────────────────────────────────────────
     trades_df = pd.DataFrame(all_trades)
     equity_df = pd.DataFrame(equity_curve).set_index("date")
 
-    metrics = compute_standard_metrics(
-        trades_df       = trades_df,
-        equity_df       = equity_df,
-        initial_capital = initial_capital,
-        final_capital   = capital,
-        start_date      = start_date,
-        end_date        = end_date,
-        periods_per_year = 12,   # monthly review cadence
+    total_return  = (capital - initial_capital) / initial_capital * 100
+    n_years       = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days / 365.25
+    annual_return = ((capital / initial_capital) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
+
+    wins    = trades_df[trades_df["pnl_pct"] > 0]  if len(trades_df) > 0 else pd.DataFrame()
+    losses  = trades_df[trades_df["pnl_pct"] <= 0] if len(trades_df) > 0 else pd.DataFrame()
+    win_rate     = len(wins) / len(trades_df) * 100 if len(trades_df) > 0 else 0
+    avg_win      = wins["pnl_pct"].mean()   if len(wins)   > 0 else 0
+    avg_loss     = losses["pnl_pct"].mean() if len(losses) > 0 else 0
+    profit_factor = (
+        (len(wins) * avg_win) / abs(len(losses) * avg_loss)
+        if len(losses) > 0 and avg_loss != 0 else 0
     )
+
+    equity_vals  = equity_df["portfolio_value"]
+    rolling_max  = equity_vals.cummax()
+    drawdowns    = (equity_vals - rolling_max) / rolling_max * 100
+    max_drawdown = drawdowns.min() if not drawdowns.empty else 0
+
+    sharpe = 0
+    if len(trades_df) > 1:
+        returns = trades_df["pnl_pct"] / 100
+        sharpe  = (returns.mean() / returns.std()) * np.sqrt(12) if returns.std() > 0 else 0
 
     reliability = _analyze_signal_reliability(trades_df)
 
@@ -1075,25 +997,18 @@ def run_backtest(
             "mode":             mode_label,
             "initial_capital":  initial_capital,
             "final_capital":    round(capital, 2),
+            "total_return":     round(total_return, 2),
+            "annual_return":    round(annual_return, 2),
             "benchmark_ticker": benchmark_ticker,
             "benchmark_return": round(benchmark_return, 2),
-            "outperformance":   round(metrics["total_return"] - benchmark_return, 2),
-            # Position sizing (Phase 3.2)
-            "sizing_method":         sizing_method,
-            "risk_per_trade_pct":    risk_per_trade_pct   if sizing_method == "atr_risk_based" else None,
-            "max_pct_per_position":  max_pct_per_position if sizing_method == "atr_risk_based" else None,
-            "liquidity_pct_adv":     liquidity_pct_adv    if sizing_method == "atr_risk_based" else None,
-            # Sector diversification (Phase 3.1)
-            "sector_cap_active":     sectors is not None,
-            "max_per_sector":        max_per_sector if sectors is not None else None,
-            # Correlation-aware limits (Phase 3.4)
-            "correlation_filter_active":  max_pairwise_correlation is not None,
-            "max_pairwise_correlation":   max_pairwise_correlation,
-            "correlation_lookback_days":  correlation_lookback_days if max_pairwise_correlation is not None else None,
-            # Standardized metrics (Phase 2.9) — total_return, annual_return,
-            # max_drawdown, sharpe/sortino/calmar_ratio, win_rate, avg_win,
-            # avg_loss, profit_factor, expectancy_pct, expectancy_abs, n_trades
-            **metrics,
+            "outperformance":   round(total_return - benchmark_return, 2),
+            "n_trades":         len(trades_df),
+            "win_rate":         round(win_rate, 2),
+            "avg_win":          round(avg_win, 2),
+            "avg_loss":         round(avg_loss, 2),
+            "profit_factor":    round(profit_factor, 2),
+            "max_drawdown":     round(max_drawdown, 2),
+            "sharpe_ratio":     round(sharpe, 2),
             # v2-specific
             "exit_score_threshold": exit_score_threshold,
             "bear_regime_exit":     bear_regime_exit,
@@ -1144,6 +1059,8 @@ def _make_trade_record(
         "signal_score": pos.get("signal_score", 0),
         "hold_days":    hold_days,
         "regime":       pos.get("regime", "fixed"),
+        "dispersion_bucket": pos.get("dispersion_bucket", "n/a"),   # Phase 4.7 audit trail
+        "size_mult":         pos.get("size_mult", 1.0),             # Phase 4.7 audit trail
         "use_trail":    pos.get("use_trail_stop", False) or pos.get("use_atr_trail", False),
     }
 
@@ -1169,12 +1086,6 @@ def print_backtest_report(results: dict) -> None:
           f"trigger=+{s.get('trail_trigger_atr')}×ATR")
     print(f"  Bear exit: {s.get('bear_regime_exit')} | "
           f"Exit score threshold: {s.get('exit_score_threshold')}")
-    if s.get("sizing_method") == "atr_risk_based":
-        print(f"  Sizing: atr_risk_based | risk/trade={s.get('risk_per_trade_pct', 0)*100:.2f}% | "
-              f"max/position={s.get('max_pct_per_position', 0)*100:.0f}% | "
-              f"liquidity cap={s.get('liquidity_pct_adv', 0)*100:.2f}% ADV")
-    else:
-        print(f"  Sizing: {s.get('sizing_method', 'fixed_fractional')}")
     print(f"{'═'*60}")
 
     print(f"\n  💰 PERFORMANCE")
@@ -1195,9 +1106,6 @@ def print_backtest_report(results: dict) -> None:
     print(f"\n  ⚠️  RISK")
     print(f"    Max drawdown:      {s['max_drawdown']:>+10.2f}%")
     print(f"    Sharpe ratio:      {s['sharpe_ratio']:>10.2f}")
-    print(f"    Sortino ratio:     {s.get('sortino_ratio', 0):>10.2f}")
-    print(f"    Calmar ratio:      {s.get('calmar_ratio', 0):>10.2f}")
-    print(f"    Expectancy:        {s.get('expectancy_pct', 0):>+9.2f}%")
 
     if "total_transaction_costs" in s:
         print(f"\n  💸 EXECUTION & COSTS")
