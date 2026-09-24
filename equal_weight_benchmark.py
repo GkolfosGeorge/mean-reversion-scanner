@@ -143,6 +143,7 @@ def run_equal_weight_comparison(
     start_date:       str,
     end_date:         str,
     initial_capital:  float,
+    benchmark_ticker: str | None = None,
 ) -> dict:
     """
     Convenience wrapper: builds the equal-weight benchmark from
@@ -150,11 +151,22 @@ def run_equal_weight_comparison(
     returns {'equity': ..., 'summary': ...} — same shape as a
     run_backtest() result, so print_equal_weight_report() (and your own
     code) can treat it uniformly alongside the strategy's own summary.
+
+    If benchmark_ticker is given (e.g. "SPY"), ALSO builds a single-ticker
+    buy-and-hold on the SAME review dates via the same
+    compute_equal_weight_benchmark() machinery, so the benchmark column gets
+    full annual_return/sharpe_ratio/max_drawdown instead of just a bare
+    total-return number — run_backtest() itself only ever computes a total
+    return % for its benchmark, never a full equity curve, so this was
+    previously unavailable. Returned under the 'benchmark' key, same shape
+    as 'equity'/'summary' above.
     """
     tickers = trades_df["ticker"].unique().tolist()
+    review_dates = _monthly_review_dates(start_date, end_date, data.index)
+
     equity_df = compute_equal_weight_benchmark(
         data=data, tickers=tickers, start_date=start_date, end_date=end_date,
-        initial_capital=initial_capital,
+        initial_capital=initial_capital, review_dates=review_dates,
     )
     metrics = compute_standard_metrics(
         trades_df=pd.DataFrame(),   # no discrete trades — buy & hold
@@ -164,22 +176,44 @@ def run_equal_weight_comparison(
         end_date=end_date,
     )
     metrics["n_tickers"] = len(tickers)
-    return {"equity": equity_df, "summary": metrics}
+    result = {"equity": equity_df, "summary": metrics}
+
+    if benchmark_ticker is not None:
+        bm_equity_df = compute_equal_weight_benchmark(
+            data=data, tickers=[benchmark_ticker], start_date=start_date, end_date=end_date,
+            initial_capital=initial_capital, review_dates=review_dates,
+        )
+        bm_metrics = compute_standard_metrics(
+            trades_df=pd.DataFrame(),
+            equity_df=bm_equity_df,
+            initial_capital=initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        result["benchmark"] = {"equity": bm_equity_df, "summary": bm_metrics}
+
+    return result
 
 
 def print_equal_weight_report(
-    strategy_summary:    dict,
+    strategy_summary:     dict,
     equal_weight_summary: dict,
-    benchmark_return:    float,
-    benchmark_ticker:    str = "SPY",
+    benchmark_summary:    dict,
+    benchmark_ticker:     str = "SPY",
 ) -> None:
     """
     Three-way comparison: Strategy vs Equal-weight-same-universe vs SPY.
     The gap between columns 1 and 2 is picking/timing skill; the gap
     between columns 2 and 3 is universe/exposure effect.
+
+    benchmark_summary must be a full metrics dict for the benchmark ticker —
+    e.g. the 'summary' returned under run_equal_weight_comparison()'s
+    'benchmark' key — not a bare total-return float, so annual_return/
+    sharpe_ratio/max_drawdown are real numbers instead of NaN placeholders.
     """
     s  = strategy_summary
     ew = equal_weight_summary
+    bm = benchmark_summary
 
     print(f"\n{'═'*70}")
     print(f"  STRATEGY vs EQUAL-WEIGHT (same universe) vs {benchmark_ticker}")
@@ -192,11 +226,12 @@ def print_equal_weight_report(
         print(f"    {label:<20}{fmt.format(s_val)}{fmt.format(ew_val)}{fmt.format(bm_val)}")
 
     print(f"    {'Metric':<20}{'Strategy':>15}{'Equal-weight':>15}{benchmark_ticker:>15}")
-    row("Total return",  s["total_return"],  ew["total_return"],  benchmark_return)
-    row("Annual return", s["annual_return"], ew["annual_return"], float("nan"))
-    row("Sharpe",        s["sharpe_ratio"],  ew["sharpe_ratio"],  float("nan"), pct=False)
-    row("Max drawdown",  s["max_drawdown"],  ew["max_drawdown"],  float("nan"))
+    row("Total return",  s["total_return"],  ew["total_return"],  bm["total_return"])
+    row("Annual return", s["annual_return"], ew["annual_return"], bm["annual_return"])
+    row("Sharpe",        s["sharpe_ratio"],  ew["sharpe_ratio"],  bm["sharpe_ratio"], pct=False)
+    row("Max drawdown",  s["max_drawdown"],  ew["max_drawdown"],  bm["max_drawdown"])
 
+    benchmark_return    = bm["total_return"]
     picking_skill_gap  = s["total_return"] - ew["total_return"]
     exposure_gap       = ew["total_return"] - benchmark_return
 

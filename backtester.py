@@ -66,23 +66,50 @@ except ImportError:
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_review_dates(
+    start_date: str,
+    end_date:   str,
+    data_index: pd.DatetimeIndex,
+    frequency:  str = "monthly",   # "monthly" | "weekly"
+) -> list[pd.Timestamp]:
+    """
+    First available trading day of each period -- used for re-scoring /
+    re-entry. "monthly" (default, backward-compatible) = first trading day
+    of each calendar month, same behavior as the original _get_monthly_dates.
+    "weekly" = first trading day of each ISO calendar week (Mon-based,
+    handles year boundaries correctly via isocalendar()) -- roughly 4x the
+    review frequency, NOT validated by Phase 6 (see roadmap: any weekly
+    result needs its own significance/adequacy pass before being trusted).
+    """
+    start = pd.Timestamp(start_date)
+    end   = pd.Timestamp(end_date)
+    trading_days = data_index[(data_index >= start) & (data_index <= end)]
+
+    if frequency == "monthly":
+        key_fn = lambda day: (day.year, day.month)
+    elif frequency == "weekly":
+        key_fn = lambda day: day.isocalendar()[:2]   # (iso_year, iso_week)
+    else:
+        raise ValueError(f"review_frequency must be 'monthly' or 'weekly', got {frequency!r}")
+
+    review_dates  = []
+    current_key   = None
+    for day in trading_days:
+        key = key_fn(day)
+        if key != current_key:
+            review_dates.append(day)
+            current_key = key
+    return review_dates
+
+
 def _get_monthly_dates(
     start_date: str,
     end_date:   str,
     data_index: pd.DatetimeIndex,
 ) -> list[pd.Timestamp]:
-    """First available trading day of each month — used for re-scoring."""
-    start = pd.Timestamp(start_date)
-    end   = pd.Timestamp(end_date)
-    trading_days  = data_index[(data_index >= start) & (data_index <= end)]
-    monthly       = []
-    current_month = None
-    for day in trading_days:
-        month_key = (day.year, day.month)
-        if month_key != current_month:
-            monthly.append(day)
-            current_month = month_key
-    return monthly
+    """Back-compat wrapper -- first available trading day of each month.
+    Prefer _get_review_dates(..., frequency=...) in new code."""
+    return _get_review_dates(start_date, end_date, data_index, frequency="monthly")
 
 
 def _compute_mr_score_at_date(
@@ -211,10 +238,11 @@ def _compute_mr_score_at_date(
 
 
 def _check_exit_daily(
-    pos:            dict,
-    period_data:    pd.DataFrame,
+    pos:                    dict,
+    period_data:            pd.DataFrame,
     max_hold_days:  int,
-    atr_trail_mult: float = 2.5,
+    atr_trail_mult:         float = 2.5,
+    realistic_stop_fills:   bool  = False,
 ) -> tuple[str | None, float | None, pd.Timestamp | None]:
     """
     3-phase stop logic — eliminates premature stops:
@@ -230,6 +258,15 @@ def _check_exit_daily(
     Phase 3 — ATR Trailing (only once close > entry + 1x ATR):
         Stop = peak - atr_trail_mult x ATR(entry).
         Lets winners run.
+
+    realistic_stop_fills (Phase 6.4 stop-gap finding, opt-in, default False for
+    backward-compatibility): when the day's Open already gapped through the
+    stop, a real order fills at that worse Open price, not at the stop level.
+    With this off, the backtest silently assumes every stop always fills at
+    its quoted price -- checked against 586 stop exits in the locked
+    no_regime baseline, this happened 49.8% of the time and inflated mean
+    trade pnl by an estimated +1.34pp. True for all three stop phases
+    (guard/breakeven/trail): whichever `current_stop` is active that day.
 
     Returns (exit_reason, exit_price, exit_date) or (None, None, None).
     """
@@ -277,7 +314,12 @@ def _check_exit_daily(
         # ── Hit stop ──────────────────────────────────────────────────────────
         if low_today <= current_stop:
             reason = f"stop_{stop_phase}"
-            return reason, round(current_stop, 2), day
+            fill_price = current_stop
+            if realistic_stop_fills:
+                open_today = row.get("Open", current_stop)
+                if pd.notna(open_today) and open_today < current_stop:
+                    fill_price = open_today   # gapped through the stop -> filled at the open
+            return reason, round(fill_price, 2), day
 
         # ── Hit target ────────────────────────────────────────────────────────
         if high_today >= pos["target_2"]:
@@ -421,6 +463,16 @@ def run_backtest(
     signal_threshold:  float = 6.5,
     max_hold_days:     int   = 365,     # safety valve only
 
+    # Re-scoring / re-entry cadence (opt-in). "monthly" (default) = original,
+    # Phase-6-validated behavior, unchanged. "weekly" = re-score/re-enter on
+    # the first trading day of each ISO week instead (~4x review frequency).
+    # NOT covered by any Phase 6 significance/adequacy/survivorship result --
+    # a "weekly" run needs its own pass through those before its numbers are
+    # trusted for anything beyond exploration. Exit logic (stops/target/max
+    # hold) is unaffected either way -- it is already checked every trading
+    # day regardless of review_frequency.
+    review_frequency:  str   = "monthly",   # "monthly" | "weekly"
+
     # ── Regime-based position sizing tilt (Phase 4.7) ──────────────────────
     # Soft size adjustment based on the dispersion axis (broad vs not-broad
     # market participation), INDEPENDENT of the composite bull/neutral/bear
@@ -460,6 +512,19 @@ def run_backtest(
     # new candidates are restricted to actual index members on the
     # review_date. None = old behavior (backward-compatible).
     membership:        pd.DataFrame | None = None,
+
+    # Tie-break control (Phase 6). Composite scores are rounded to 2 decimals, so several
+    # candidates can share the same score at the top-N cut (typical on panic dates when many
+    # names saturate). None (default) = DETERMINISTIC alphabetical order. An int = a
+    # reproducible pseudo-random tie-break order (different int -> different order), used only
+    # to measure how much the headline metrics depend on arbitrary tie-breaking.
+    tiebreak_seed:     int | None = None,
+
+    # Realistic stop fills (Phase 6.4 finding). False (default) = old behavior:
+    # a stop always fills at its quoted price even if the day gapped below it.
+    # True = fill at that day's Open when Open < stop (never fills BETTER than
+    # quoted -- only ever more realistic/worse). See _check_exit_daily docstring.
+    realistic_stop_fills: bool = False,
 
     # ── Position sizing methodology (Phase 3.2) ────────────────────────────
     # "fixed_fractional" (default, backward-compatible): allocated =
@@ -583,7 +648,7 @@ def run_backtest(
     cumulative_costs = 0.0
 
     available_tickers = data.columns.get_level_values(0).unique().tolist()
-    monthly_dates     = _get_monthly_dates(start_date, end_date, data.index)
+    monthly_dates     = _get_review_dates(start_date, end_date, data.index, frequency=review_frequency)
 
     # ── Real per-ticker "last traded" date ───────────────────────────────────
     # `available_tickers` is a static snapshot of columns present in `data` —
@@ -643,7 +708,7 @@ def run_backtest(
         print(f"   ⚠️  {skipped} date(s) skipped (warm-up {warmup_needed} rows)")
     monthly_dates = valid_dates
 
-    print(f"   Monthly review dates: {len(monthly_dates)}")
+    print(f"   Review dates ({review_frequency}): {len(monthly_dates)}")
     print(f"   Universe: {len(available_tickers)} tickers\n")
 
     # ── Benchmark ─────────────────────────────────────────────────────────────
@@ -773,6 +838,7 @@ def run_backtest(
                 period_data,
                 max_hold_days = pos.get("max_hold_days", cur_max_hold),
                 atr_trail_mult = atr_trail_mult,
+                realistic_stop_fills = realistic_stop_fills,
             )
 
             if reason:
@@ -858,10 +924,16 @@ def run_backtest(
         # index members on review_date are eligible for NEW positions.
         # Existing positions are unaffected (see steps 1-2) — leaving the
         # index doesn't force a sale, only delisting does.
+        # NOTE (determinism fix): the membership path used to iterate a SET of strings, whose
+        # order changes between Python processes (hash randomization) -> ties in signal_score
+        # were broken differently on every fresh kernel. sorted() makes it reproducible.
         if membership_intervals is not None:
-            candidate_universe = _tickers_active_on(review_date, membership_intervals) & set(available_tickers)
+            candidate_universe = sorted(_tickers_active_on(review_date, membership_intervals) & set(available_tickers))
         else:
-            candidate_universe = available_tickers
+            candidate_universe = list(available_tickers)
+        if tiebreak_seed is not None:
+            _rng_tb = np.random.default_rng([int(tiebreak_seed), review_date.toordinal()])
+            candidate_universe = [candidate_universe[i] for i in _rng_tb.permutation(len(candidate_universe))]
 
         n_new_opens = 0
         if slots_available > 0 and deployable > 100 and entry_allowed:
