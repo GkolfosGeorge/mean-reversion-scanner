@@ -29,6 +29,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Fundamentals cards. A separate step on purpose:
+      # - continue-on-error: if this install fails, the mail still goes out, just without cards
+      # - --no-deps: the tagged single-asset-analyzer carries its OWN trading-shared-data pin
+      #   in pyproject.toml; without --no-deps it would clash with the one in requirements.txt
+      #   the moment shared-data-layer gets a newer tag. Its deps (matplotlib, pandas, ...) are
+      #   already installed by requirements.txt above.
+      # The tag below is updated by: shared data layer/update_pins.sh saa vX.Y.Z
+      - name: Install fundamentals package (optional)
+        continue-on-error: true
+        run: pip install --no-deps "single-asset-analyzer @ git+https://github.com/GkolfosGeorge/single-asset-analyzer.git@v0.1.1"
+
       - name: Run mega-cap alert check
         env:
           DATABASE_URL:       ${{ secrets.DATABASE_URL }}     # fundamentals cards (optional: mail still sent without it)
