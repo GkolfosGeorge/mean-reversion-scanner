@@ -33,7 +33,16 @@ Uses Yahoo SMTP (smtp.mail.yahoo.com). The env var names below still say
 names just weren't renamed to avoid touching the GitHub Secrets / workflow
 config. Functionally it's Yahoo, not Gmail.
 
+── FUNDAMENTALS (single-asset-analyzer, Oct 2026) ───────────────────────────
+Under each mega-cap ticker: a 3–6 line valuation/quality card; under each
+watchlist ticker: one line (nothing for ETFs / foreign filers). Comes from
+single-asset-analyzer's valuation/quick.py. It is INFORMATION, not a filter,
+and it can never block the email: no DATABASE_URL, a package that won't
+import, a database or Yahoo error, or the time budget running out all just
+mean "no card" for that ticker — the technical alert is sent as before.
+
 ── SECRETS (set as GitHub repo secrets, read via env vars) ──────────────────
+  DATABASE_URL        - Neon Postgres connection string (fundamentals card)
   GMAIL_USER          - sender Yahoo address (despite the name)
   GMAIL_APP_PASSWORD  - Yahoo App Password (NOT your regular password —
                          generate one from Yahoo Account Security ->
@@ -42,13 +51,17 @@ config. Functionally it's Yahoo, not Gmail.
 
 Usage:
     python mega_cap_alert.py
+    ALERT_DRY_RUN=1 python mega_cap_alert.py     # print the email instead of sending it
 """
 
 import os
 import sys
+import time
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
+
+import pandas as pd     # used by _diagnose_exclusion (was missing: NameError on a rare path)
 
 from ticker_provider import get_tickers
 from sector_lookup import get_sectors_and_caps
@@ -64,6 +77,8 @@ ALERT_CAP_TIERS       = [4,5]     # <-- mega-cap section: e.g. [4, 5] for Mega +
 WATCHLIST              = ["BABA", "V","UNH","GOOG","AMZN","NFLX","EBAY","AVGO","VT","COPX","IEMG"]   # <-- always-shown tickers, any yfinance symbol
 UNIVERSE               = "sp500"
 DATA_FOLDER            = "data"
+FUNDAMENTALS           = True     # <-- False turns the fundamentals cards off
+FUNDAMENTALS_BUDGET_S  = 480      # stop analysing after 8 min (job timeout is 20)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -186,6 +201,38 @@ def get_watchlist_scores() -> tuple[list[dict], list[tuple[str, str]]]:
     return scored, missing
 
 
+def get_fundamentals_cards(tickers: list[str]) -> dict:
+    """
+    {ticker: QuickSnapshot} for as many tickers as the time budget allows.
+    Returns {} — never raises — if anything at all is wrong, so the email
+    always goes out.
+    """
+    if not FUNDAMENTALS or not tickers:
+        return {}
+    if not os.environ.get("DATABASE_URL"):
+        print("   [Fundamentals] ⚠️ DATABASE_URL not set — skipping cards.")
+        return {}
+    try:
+        from db import get_engine
+        from valuation.quick import quick_snapshot
+        engine = get_engine()
+    except Exception as e:
+        print(f"   [Fundamentals] ⚠️ unavailable ({type(e).__name__}: {e}) — skipping cards.")
+        return {}
+
+    out, t0 = {}, time.time()
+    for t in dict.fromkeys(tickers):                       # unique, keep order
+        if time.time() - t0 > FUNDAMENTALS_BUDGET_S:
+            print(f"   [Fundamentals] ⏱️ time budget reached — {len(out)}/{len(tickers)} analysed.")
+            break
+        try:
+            out[t] = quick_snapshot(t, engine)
+        except Exception as e:                             # quick_snapshot shouldn't raise; belt and braces
+            print(f"   [Fundamentals] {t}: {type(e).__name__}: {e}")
+    print(f"   [Fundamentals] {len(out)} ticker(s) analysed in {time.time() - t0:.0f}s")
+    return out
+
+
 def main():
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     print(f"🔍 Alert check — {now_str}")
@@ -197,7 +244,9 @@ def main():
         print("   Nothing to report — no email sent.")
         return
 
-    send_email(mega_scored, watchlist_scored, watchlist_missing, now_str)
+    cards = get_fundamentals_cards([s["ticker"] for s in mega_scored] +
+                                   [s["ticker"] for s in watchlist_scored])
+    send_email(mega_scored, watchlist_scored, watchlist_missing, now_str, cards)
 
 
 def _format_ticker_block(s: dict) -> list[str]:
@@ -233,7 +282,30 @@ def send_email(
     watchlist_scored:   list[dict],
     watchlist_missing:  list[tuple[str, str]],
     now_str:            str,
+    cards:              dict | None = None,
 ) -> None:
+    cards = cards or {}
+    try:
+        from valuation.quick import format_card, format_line, legend
+    except Exception:
+        format_card = format_line = legend = None
+        cards = {}
+
+    def _card(s: dict, full: bool) -> list[str]:
+        """Fundamentals lines for one ticker; [] on any problem."""
+        ticker = s["ticker"]
+        if ticker not in cards:
+            return ["  📊 Θεμελιώδη: παραλείφθηκαν (όριο χρόνου)"] if (full and FUNDAMENTALS and cards) else []
+        try:
+            snap = cards[ticker]
+            # the scorer already knows the sector: more reliable than guessing
+            # "bank" from missing EBIT/capex (SCHW, for one, has a capex tag)
+            if s.get("sector") == "Financial Services":
+                snap.financial = True
+            return format_card(snap) if full else format_line(snap)
+        except Exception:
+            return []
+
     lines = [f"Daily Alert — {now_str}", ""]
 
     lines.append("═" * 50)
@@ -241,7 +313,8 @@ def send_email(
     lines.append("═" * 50)
     if mega_scored:
         for s in mega_scored:
-            lines.extend(_format_ticker_block(s))
+            block = _format_ticker_block(s)          # ends with a blank line
+            lines.extend(block[:-1] + _card(s, full=True) + [""])
     else:
         lines.append("No qualifying mega-cap opportunities today.")
         lines.append("")
@@ -251,17 +324,27 @@ def send_email(
         lines.append("WATCHLIST (always shown, regardless of score)")
         lines.append("═" * 50)
         for s in sorted(watchlist_scored, key=lambda x: -x["composite_score"]):
-            lines.extend(_format_ticker_block(s))
+            block = _format_ticker_block(s)
+            lines.extend(block[:-1] + _card(s, full=False) + [""])
         if watchlist_missing:
             lines.append("Not scored (reason shown per ticker):")
             for ticker, reason in watchlist_missing:
                 lines.append(f"  {ticker}: {reason}")
             lines.append("")
 
+    if cards and legend:
+        lines.append("─" * 50)
+        lines.extend(legend())
+        lines.append("")
     lines.append("─" * 50)
     lines.append("Generated automatically by mega_cap_alert.py")
 
     body = "\n".join(lines)
+
+    if os.environ.get("ALERT_DRY_RUN"):
+        print("\n" + "=" * 70 + "\n" + body + "\n" + "=" * 70)
+        print("   (ALERT_DRY_RUN set — email NOT sent)")
+        return
 
     gmail_user  = os.environ["GMAIL_USER"]
     app_pw      = os.environ["GMAIL_APP_PASSWORD"]
