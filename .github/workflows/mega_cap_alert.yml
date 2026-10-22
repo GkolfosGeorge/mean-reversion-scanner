@@ -38,7 +38,7 @@ jobs:
       # The tag below is updated by: shared data layer/update_pins.sh saa vX.Y.Z
       - name: Install fundamentals package (optional)
         continue-on-error: true
-        run: pip install --no-deps "single-asset-analyzer @ git+https://github.com/GkolfosGeorge/single-asset-analyzer.git@v0.1.1"
+        run: pip install --no-deps "single-asset-analyzer @ git+https://github.com/GkolfosGeorge/single-asset-analyzer.git@v0.1.2"
 
       - name: Run mega-cap alert check
         env:
